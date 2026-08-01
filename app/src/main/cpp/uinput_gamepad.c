@@ -5,15 +5,16 @@
 // Button/axis codes verified against the real kernel uapi header
 // (torvalds/linux include/uapi/linux/input-event-codes.h) rather than assumed:
 //   BTN_A=BTN_SOUTH=0x130 BTN_B=BTN_EAST=0x131 BTN_X=BTN_NORTH=0x133 BTN_Y=BTN_WEST=0x134
-//   BTN_TL=0x136 BTN_TR=0x137 BTN_SELECT=0x13a BTN_START=0x13b BTN_MODE=0x13c
-//   BTN_THUMBL=0x13d BTN_THUMBR=0x13e
+//   BTN_TL=0x136 BTN_TR=0x137 BTN_START=0x13b BTN_MODE=0x13c BTN_THUMBL=0x13d BTN_THUMBR=0x13e
 //   ABS_X=0 ABS_Y=1 ABS_Z=2 ABS_RZ=5 ABS_GAS=9 ABS_BRAKE=0xa ABS_HAT0X=0x10 ABS_HAT0Y=0x11
-// GAS/BRAKE (not LTRIGGER/RTRIGGER) is deliberate: Android's InputReader only recognizes
-// LTRIGGER/RTRIGGER via a device-specific .kl file, which an unrecognized vendor/product
-// uinput device won't have — it falls back to Generic.kl, which maps analog triggers to
-// GAS/BRAKE. Android's own JoystickInputMapper then auto-derives compat LTRIGGER/RTRIGGER
-// axes FROM those (confirmed by reading frameworks/native's own compat-remap code), so apps
-// expecting either axis name still see values. NOT live-verified on real hardware yet.
+// Live-verified on the Shield: our vendor/product (0x045e/0x02fd) matches a REAL Xbox
+// controller .kl file already on the device (/system/usr/keylayout/Vendor_045e_Product_02fd.kl,
+// pulled and read directly), not the Generic.kl fallback assumed when this was written. That
+// file confirms GAS/BRAKE->RTRIGGER/LTRIGGER as guessed below, but also revealed a real bug:
+// it maps View/Select to raw KEY_BACK (158), NOT BTN_SELECT (0x13a) — sending 0x13a produced
+// an event this .kl file has no rule for, so View never became a KeyEvent RetroArch could see.
+// KEY_BACK is in the low keyboard-code range, not the BTN_* gamepad range, hence the separate
+// UI_SET_KEYBIT below.
 //
 // uinput force-feedback upload/erase/play protocol is the standard documented one from
 // include/uapi/linux/uinput.h's own header comment (EV_UINPUT/UI_FF_UPLOAD/UI_FF_ERASE,
@@ -75,7 +76,7 @@ Java_com_vanzetta_gipbridge_GamepadInjectorService_nativeOpenUinput(JNIEnv *env,
 
     static const int buttons[] = {
         BTN_A, BTN_B, BTN_X, BTN_Y, BTN_TL, BTN_TR,
-        BTN_THUMBL, BTN_THUMBR, BTN_SELECT, BTN_START, BTN_MODE,
+        BTN_THUMBL, BTN_THUMBR, KEY_BACK, BTN_START, BTN_MODE,
     };
     for (size_t i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++) {
         ioctl(fd, UI_SET_KEYBIT, buttons[i]);

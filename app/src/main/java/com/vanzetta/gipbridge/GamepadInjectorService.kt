@@ -23,10 +23,16 @@ private const val BTN_X = 0x133
 private const val BTN_Y = 0x134
 private const val BTN_TL = 0x136
 private const val BTN_TR = 0x137
-private const val BTN_SELECT = 0x13a
 private const val BTN_START = 0x13b
 private const val BTN_THUMBL = 0x13d
 private const val BTN_THUMBR = 0x13e
+// NOT BTN_SELECT (0x13a) — the real Xbox .kl file this device matched
+// (/system/usr/keylayout/Vendor_045e_Product_02fd.kl, confirmed by pulling it off a live
+// Shield) maps the View/Select button to raw KEY_BACK (158), not the joystick-range
+// BTN_SELECT code. Sending 0x13a produced an event this .kl file has no rule for, so it
+// never became a BUTTON_SELECT KeyEvent — confirmed live as the real cause of View not
+// registering in RetroArch.
+private const val KEY_BACK = 158
 
 /**
  * Instantiated by Shizuku via reflection in a process it spawns under the ADB shell UID
@@ -91,7 +97,7 @@ class GamepadInjectorService : IGamepadInjector.Stub() {
         KeyEvent.KEYCODE_BUTTON_THUMBL to BTN_THUMBL,
         KeyEvent.KEYCODE_BUTTON_THUMBR to BTN_THUMBR,
         KeyEvent.KEYCODE_BUTTON_START to BTN_START,
-        KeyEvent.KEYCODE_BUTTON_SELECT to BTN_SELECT,
+        KeyEvent.KEYCODE_BUTTON_SELECT to KEY_BACK,
     )
 
     override fun injectKey(keyCode: Int, down: Boolean) {
