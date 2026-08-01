@@ -155,8 +155,21 @@ class GipBridgeService : Service() {
     // the RetroArch/Android InputDevice-vibrator integration layer.
     private val testRumbleReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            log("Test rumble triggered.")
-            sendRumble(100, 100, 1000)
+            log("Test rumble sequence: large motor, small motor, left trigger, right trigger, all together.")
+            thread(name = "test-rumble-sequence") {
+                fun pulse(label: String, motors: Int) {
+                    log("Test rumble: $label")
+                    sendRumble(100, 100, 700, motors)
+                    Thread.sleep(700)
+                    sendRumble(0, 0, 0, motors)
+                    Thread.sleep(600)
+                }
+                pulse("LEFT (large/strong) motor only", GipMotor.LEFT)
+                pulse("RIGHT (small/weak) motor only", GipMotor.RIGHT)
+                pulse("LEFT TRIGGER motor only", GipMotor.TRIGGER_LEFT)
+                pulse("RIGHT TRIGGER motor only", GipMotor.TRIGGER_RIGHT)
+                pulse("ALL motors together", GipMotor.ALL)
+            }
         }
     }
 
@@ -501,7 +514,7 @@ class GipBridgeService : Service() {
 
     // strongPercent/weakPercent are 0-100, scaled down further by the user's configured
     // rumble strength. durationMs=0 sends an explicit stop (all motors off).
-    private fun sendRumble(strongPercent: Int, weakPercent: Int, durationMs: Int) {
+    private fun sendRumble(strongPercent: Int, weakPercent: Int, durationMs: Int, motors: Int = GipMotor.ALL) {
         val conn = gipConnection ?: return
         val epOut = gipEpOut ?: return
         if (durationMs > 0 && !DeviceConfig.rumbleEnabled(this)) return
@@ -511,7 +524,7 @@ class GipBridgeService : Service() {
         val right = (weakPercent * userStrength / 100).coerceIn(0, 100)
         val durationTens = (durationMs / 10).coerceIn(0, 255)
 
-        val payload = buildRumblePayload(left = left, right = right, durationTens = durationTens)
+        val payload = buildRumblePayload(motors = motors, leftTrigger = left, rightTrigger = right, left = left, right = right, durationTens = durationTens)
         val hdr = GipHeader(
             command = GipCommand.RUMBLE,
             options = 0, // per xone's gip_send_rumble: clientId only, no INTERNAL flag
