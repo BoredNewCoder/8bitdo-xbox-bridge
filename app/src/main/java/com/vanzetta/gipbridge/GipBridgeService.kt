@@ -471,7 +471,7 @@ class GipBridgeService : Service() {
         }
         inj.injectAxes(
             state.stickLeftX / 32767f,
-            state.stickLeftY / 32767f,
+            -state.stickLeftY / 32767f, // confirmed live: inverted (down read as up) via the real uinput device — old injectInputEvent path didn't have this issue
             state.stickRightX / 32767f,
             state.stickRightY / 32767f,
             state.triggerLeft / 1023f,
