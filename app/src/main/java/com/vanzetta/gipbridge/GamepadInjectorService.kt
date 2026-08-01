@@ -9,6 +9,9 @@ import android.view.InputEvent
 import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.content.Context
+import android.content.Intent
+import android.provider.Settings
 import kotlin.concurrent.thread
 
 private const val TAG = "GipInjector"
@@ -169,6 +172,22 @@ class GamepadInjectorService : IGamepadInjector.Stub() {
         rumblePolling = false
         rumbleThread?.interrupt()
         rumbleThread = null
+    }
+
+    // KEYCODE_SETTINGS injection was tried first and confirmed live to fire with no error, but
+    // this Shield's launcher (FLauncher, not stock) apparently doesn't intercept that keycode
+    // the way it does HOME — the foreground app (RetroArch) just swallows it, nothing opens.
+    // Launching the Activity directly from this shell-UID process works instead: unlike the
+    // main app process (a foreground Service with no visible window, confirmed blocked by
+    // Android's background-activity-launch restriction), the shell UID has the same
+    // activity-start privileges `adb shell am start` has used successfully throughout this
+    // whole session.
+    override fun openSettings() {
+        runCatching {
+            val activityThread = Class.forName("android.app.ActivityThread")
+            val context = activityThread.getMethod("currentApplication").invoke(null) as Context
+            context.startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        }.onFailure { Log.e(TAG, "openSettings failed: ${it.message}") }
     }
 
     override fun destroy() {

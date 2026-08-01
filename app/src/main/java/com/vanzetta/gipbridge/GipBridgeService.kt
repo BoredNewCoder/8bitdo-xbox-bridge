@@ -81,14 +81,13 @@ class GipBridgeService : Service() {
         // Confirmed live: startActivity(ACTION_SETTINGS) from here gets silently blocked by
         // Android's background-activity-launch restriction ("Background activity start...
         // isCallingUidForeground: false") — a foreground Service has no visible window, so it
-        // doesn't qualify to launch an Activity directly, even though HOME short-press (a key
-        // *injection*, not an activity start) works fine from the same context. KEYCODE_SETTINGS
-        // is a real system key the framework itself intercepts to open Settings, so routing it
-        // through the same injection path used for HOME sidesteps the restriction entirely.
+        // doesn't qualify to launch an Activity directly. Tried KEYCODE_SETTINGS injection next
+        // (works for HOME) but this Shield's launcher doesn't intercept that keycode, so
+        // RetroArch just swallowed it. Launching from the Shizuku shell-UID process instead —
+        // that UID has real activity-start privileges.
         runCatching {
-            injector?.injectKey(KeyEvent.KEYCODE_SETTINGS, true)
-            injector?.injectKey(KeyEvent.KEYCODE_SETTINGS, false)
-        }.onFailure { log("Settings key injection failed: ${it.message}") }
+            injector?.openSettings()
+        }.onFailure { log("Settings launch failed: ${it.message}") }
     }
 
     private val userServiceArgs = Shizuku.UserServiceArgs(

@@ -12,5 +12,6 @@ interface IGamepadInjector {
     void injectAxes(float x, float y, float z, float rz, float ltrigger, float rtrigger, float hatX, float hatY);
     void startRumble(IRumbleCallback callback);
     void stopRumble();
+    void openSettings();
     void destroy();
 }
