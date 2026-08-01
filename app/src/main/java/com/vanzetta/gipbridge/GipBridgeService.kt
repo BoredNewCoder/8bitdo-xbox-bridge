@@ -60,6 +60,7 @@ class GipBridgeService : Service() {
     private lateinit var usbManager: UsbManager
     private var readerThread: Thread? = null
     @Volatile private var running = false
+    private var gipConnection: UsbDeviceConnection? = null
 
     // Read fresh each call (not cached) so a config change via SettingsActivity takes
     // effect on the next USB attach event without needing a service restart.
@@ -142,6 +143,23 @@ class GipBridgeService : Service() {
         }
     }
 
+    // Without this, unplugging mid-session leaves the read loop spinning on repeated
+    // failed transfers with nothing telling it to stop — the connection/interface are
+    // gone but `running`/`g733Running` stay true until the app itself is killed.
+    private val usbDetachReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val device: UsbDevice? = intent.getParcelableExtraCompat(UsbManager.EXTRA_DEVICE)
+            if (device == null) return
+            if (isController(device)) {
+                log("Controller detached.")
+                stopGipSession()
+            } else if (isHeadset(device)) {
+                log("Headset detached.")
+                stopG733Session()
+            }
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
@@ -150,14 +168,18 @@ class GipBridgeService : Service() {
 
         val permFilter = IntentFilter(ACTION_USB_PERMISSION)
         val attachFilter = IntentFilter(UsbManager.ACTION_USB_DEVICE_ATTACHED)
+        val detachFilter = IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(usbPermissionReceiver, permFilter, Context.RECEIVER_NOT_EXPORTED)
             registerReceiver(usbAttachReceiver, attachFilter, Context.RECEIVER_NOT_EXPORTED)
+            registerReceiver(usbDetachReceiver, detachFilter, Context.RECEIVER_NOT_EXPORTED)
         } else {
             @Suppress("UnspecifiedRegisterReceiverFlag")
             registerReceiver(usbPermissionReceiver, permFilter)
             @Suppress("UnspecifiedRegisterReceiverFlag")
             registerReceiver(usbAttachReceiver, attachFilter)
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(usbDetachReceiver, detachFilter)
         }
 
         Shizuku.addRequestPermissionResultListener(shizukuPermissionListener)
@@ -210,6 +232,16 @@ class GipBridgeService : Service() {
             if (isHeadset(device)) startG733Session(device) else if (isController(device)) startGipSession(device)
             return
         }
+        // Confirmed live: requesting permission while nothing is in the foreground (TV
+        // screensaver active) can leave the request permanently stuck with no dialog ever
+        // shown — the system needs a foreground surface to anchor the prompt to. Bring the
+        // app forward first so the dialog always has somewhere to attach.
+        runCatching {
+            startActivity(
+                Intent(this, MainActivity::class.java)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+            )
+        }
         val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_MUTABLE else 0
         val pi = PendingIntent.getBroadcast(this, 0, Intent(ACTION_USB_PERMISSION), flags)
         usbManager.requestPermission(device, pi)
@@ -259,8 +291,17 @@ class GipBridgeService : Service() {
         }
 
         log("Interface claimed. IN ep=0x${epIn.address.toString(16)} OUT ep=0x${epOut.address.toString(16)}. Starting read loop...")
+        gipConnection = connection
         running = true
         readerThread = thread(name = "gip-reader") { readLoop(connection, epIn, epOut) }
+    }
+
+    private fun stopGipSession() {
+        running = false
+        readerThread?.join(500)
+        runCatching { gipConnection?.close() }
+        gipConnection = null
+        readerThread = null
     }
 
     private fun readLoop(conn: UsbDeviceConnection, epIn: UsbEndpoint, epOut: UsbEndpoint) {
@@ -269,7 +310,9 @@ class GipBridgeService : Service() {
         var inputPacketsSeen = 0
         while (running) {
             val n = conn.bulkTransfer(epIn, buf, buf.size, 2000)
-            if (n <= 0) continue // timeout or nothing yet — keep polling
+            // n<=0 also happens on a genuine detach (immediate failure, not a timeout) —
+            // a short sleep here guarantees this never busy-spins regardless of which.
+            if (n <= 0) { Thread.sleep(50); continue }
 
             packetsSeen++
 
@@ -477,11 +520,23 @@ class GipBridgeService : Service() {
         g733ReaderThread = thread(name = "g733-reader") { g733ReadLoop(connection, epIn) }
     }
 
+    private fun stopG733Session() {
+        g733Running = false
+        g733ReaderThread?.join(500)
+        runCatching { g733Connection?.close() }
+        g733Connection = null
+        g733HidIface = null
+        g733ReaderThread = null
+        g733BatteryToast?.cancel()
+    }
+
     private fun g733ReadLoop(conn: UsbDeviceConnection, epIn: UsbEndpoint) {
         val buf = ByteArray(64)
         while (g733Running) {
             val n = conn.bulkTransfer(epIn, buf, buf.size, 2000)
-            if (n <= 0) continue
+            // n<=0 also happens on a genuine detach (immediate failure, not a timeout) —
+            // a short sleep here guarantees this never busy-spins regardless of which.
+            if (n <= 0) { Thread.sleep(50); continue }
             val data = buf.copyOf(n)
             parseG733Report(data)
         }
@@ -613,12 +668,11 @@ class GipBridgeService : Service() {
     }
 
     override fun onDestroy() {
-        running = false
-        readerThread?.join(500)
-        g733Running = false
-        g733ReaderThread?.join(500)
+        stopGipSession()
+        stopG733Session()
         runCatching { unregisterReceiver(usbPermissionReceiver) }
         runCatching { unregisterReceiver(usbAttachReceiver) }
+        runCatching { unregisterReceiver(usbDetachReceiver) }
         runCatching { Shizuku.unbindUserService(userServiceArgs, userServiceConnection, true) }
         runCatching { Shizuku.removeRequestPermissionResultListener(shizukuPermissionListener) }
         super.onDestroy()

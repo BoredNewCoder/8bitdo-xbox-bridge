@@ -46,6 +46,12 @@ that same wire protocol as an Android USB Host API client, then uses
   `adb shell dumpsys usb`'s live permission store, which only ever retains the grant for
   the non-audio 8BitDo controller. This is a privacy protection, not a bug, and there's no
   legitimate way around it. One tap after a reboot, and it's done until the next reboot.
+- Rarely, unplugging and replugging a device a **second** time within the same app session
+  (without the app being restarted in between) can leave the permission request stuck with
+  no dialog ever shown. Looks like an Android-level throttle on repeated permission
+  prompts from the same process, not something fixable cleanly from app code. Workaround:
+  force-stop the app and reopen it (Android TV Settings → Apps → GIP Bridge → Force stop).
+  A first-time attach in a fresh app launch always works.
 
 ## Requirements
 
