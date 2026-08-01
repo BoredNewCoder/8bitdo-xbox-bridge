@@ -61,6 +61,7 @@ class GipBridgeService : Service() {
     private var readerThread: Thread? = null
     @Volatile private var running = false
     private var gipConnection: UsbDeviceConnection? = null
+    private var gipEpOut: UsbEndpoint? = null
 
     // Read fresh each call (not cached) so a config change via SettingsActivity takes
     // effect on the next USB attach event without needing a service restart.
@@ -86,10 +87,25 @@ class GipBridgeService : Service() {
         ComponentName(BuildConfig.APPLICATION_ID, GamepadInjectorService::class.java.name)
     ).daemon(false).processNameSuffix("injector").debuggable(false).version(1)
 
+    // Runs on a binder thread from the Shizuku process's FF poll loop. durationMs is currently
+    // always 0 from GamepadInjectorService (ff_replay.length parsing deferred) — treated as
+    // "play until stop", matched with a short repeat/rearm window since GIP rumble packets are
+    // one-shot with an explicit duration, not a persistent on/off state like Linux FF play/stop.
+    private val rumbleCallback = object : IRumbleCallback.Stub() {
+        override fun onRumble(strongPercent: Int, weakPercent: Int, durationMs: Int) {
+            sendRumble(strongPercent, weakPercent, if (durationMs > 0) durationMs else 200)
+        }
+        override fun onRumbleStop() {
+            sendRumble(0, 0, 0)
+        }
+    }
+
     private val userServiceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             injector = IGamepadInjector.Stub.asInterface(binder)
             log("Shizuku injector service connected.")
+            runCatching { injector?.startRumble(rumbleCallback) }
+                .onFailure { log("startRumble registration failed: ${it.message}") }
         }
         override fun onServiceDisconnected(name: ComponentName) {
             injector = null
@@ -292,6 +308,7 @@ class GipBridgeService : Service() {
 
         log("Interface claimed. IN ep=0x${epIn.address.toString(16)} OUT ep=0x${epOut.address.toString(16)}. Starting read loop...")
         gipConnection = connection
+        gipEpOut = epOut
         running = true
         readerThread = thread(name = "gip-reader") { readLoop(connection, epIn, epOut) }
     }
@@ -301,6 +318,7 @@ class GipBridgeService : Service() {
         readerThread?.join(500)
         runCatching { gipConnection?.close() }
         gipConnection = null
+        gipEpOut = null
         readerThread = null
     }
 
@@ -464,6 +482,28 @@ class GipBridgeService : Service() {
         )
         writePacket(conn, epOut, hdr, ByteArray(0))
         log("Sent IDENTIFY request")
+    }
+
+    // strongPercent/weakPercent are 0-100, scaled down further by the user's configured
+    // rumble strength. durationMs=0 sends an explicit stop (all motors off).
+    private fun sendRumble(strongPercent: Int, weakPercent: Int, durationMs: Int) {
+        val conn = gipConnection ?: return
+        val epOut = gipEpOut ?: return
+        if (durationMs > 0 && !DeviceConfig.rumbleEnabled(this)) return
+
+        val userStrength = DeviceConfig.rumbleStrength(this)
+        val left = (strongPercent * userStrength / 100).coerceIn(0, 100)
+        val right = (weakPercent * userStrength / 100).coerceIn(0, 100)
+        val durationTens = (durationMs / 10).coerceIn(0, 255)
+
+        val payload = buildRumblePayload(left = left, right = right, durationTens = durationTens)
+        val hdr = GipHeader(
+            command = GipCommand.RUMBLE,
+            options = 0, // per xone's gip_send_rumble: clientId only, no INTERNAL flag
+            sequence = nextSeq(),
+            packetLength = payload.size,
+        )
+        writePacket(conn, epOut, hdr, payload)
     }
 
     private fun writePacket(conn: UsbDeviceConnection, epOut: UsbEndpoint, hdr: GipHeader, payload: ByteArray) {
@@ -673,6 +713,7 @@ class GipBridgeService : Service() {
         runCatching { unregisterReceiver(usbPermissionReceiver) }
         runCatching { unregisterReceiver(usbAttachReceiver) }
         runCatching { unregisterReceiver(usbDetachReceiver) }
+        runCatching { injector?.stopRumble() }
         runCatching { Shizuku.unbindUserService(userServiceArgs, userServiceConnection, true) }
         runCatching { Shizuku.removeRequestPermissionResultListener(shizukuPermissionListener) }
         super.onDestroy()

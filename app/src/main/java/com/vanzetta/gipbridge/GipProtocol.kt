@@ -205,6 +205,41 @@ fun parseGamepadInput(data: ByteArray): GamepadState? {
     )
 }
 
+// GIP_GP_MOTOR_* from xone's driver/gamepad.c. RUMBLE header options = clientId only (no
+// GIP_OPT_INTERNAL) — verified against bus/protocol.c's gip_send_rumble, which differs from
+// every other outgoing command in this file (POWER/IDENTIFY/ACKNOWLEDGE all set INTERNAL).
+object GipMotor {
+    const val RIGHT = 1 shl 0
+    const val LEFT = 1 shl 1
+    const val TRIGGER_RIGHT = 1 shl 2
+    const val TRIGGER_LEFT = 1 shl 3
+    const val ALL = RIGHT or LEFT or TRIGGER_RIGHT or TRIGGER_LEFT
+}
+
+/** struct gip_gamepad_pkt_rumble from xone's driver/gamepad.c — 9 bytes, values 0-100 except
+ *  duration/delay/repeat which are raw u8 (duration/delay in ~10ms units per xone's own
+ *  GIP_GP_RUMBLE_DELAY comment). */
+fun buildRumblePayload(
+    motors: Int = GipMotor.ALL,
+    leftTrigger: Int = 0,
+    rightTrigger: Int = 0,
+    left: Int = 0,
+    right: Int = 0,
+    durationTens: Int = 0xFF,
+    delayTens: Int = 0,
+    repeat: Int = 0,
+): ByteArray = byteArrayOf(
+    0x00,
+    motors.toByte(),
+    leftTrigger.coerceIn(0, 100).toByte(),
+    rightTrigger.coerceIn(0, 100).toByte(),
+    left.coerceIn(0, 100).toByte(),
+    right.coerceIn(0, 100).toByte(),
+    durationTens.coerceIn(0, 255).toByte(),
+    delayTens.coerceIn(0, 255).toByte(),
+    repeat.coerceIn(0, 255).toByte(),
+)
+
 data class GipAnnounce(
     val address: ByteArray,
     val vendorId: Int,

@@ -44,6 +44,7 @@ class SettingsActivity : Activity() {
         })
 
         container.addView(currentConfigView())
+        container.addView(rumbleSection())
 
         val devices = usbManager.deviceList.values.toList()
         if (devices.isEmpty()) {
@@ -86,6 +87,57 @@ class SettingsActivity : Activity() {
             })
             container.addView(row)
         }
+    }
+
+    private fun rumbleSection(): LinearLayout {
+        val section = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 0, 0, 32)
+        }
+        section.addView(TextView(this).apply {
+            text = "Rumble (RetroArch/emulators)"
+            textSize = 15f
+        })
+
+        val statusRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        statusRow.addView(TextView(this).apply {
+            text = "Enabled: ${DeviceConfig.rumbleEnabled(this@SettingsActivity)}  " +
+                "Strength: ${DeviceConfig.rumbleStrength(this@SettingsActivity)}%"
+            textSize = 13f
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        })
+        section.addView(statusRow)
+
+        val controlsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, 16, 0, 0)
+        }
+        controlsRow.addView(Button(this).apply {
+            text = if (DeviceConfig.rumbleEnabled(this@SettingsActivity)) "Turn Off" else "Turn On"
+            isFocusableInTouchMode = true
+            setOnClickListener {
+                DeviceConfig.setRumbleEnabled(this@SettingsActivity, !DeviceConfig.rumbleEnabled(this@SettingsActivity))
+                render()
+            }
+        })
+        controlsRow.addView(Button(this).apply {
+            text = "-10%"
+            isFocusableInTouchMode = true
+            setOnClickListener {
+                DeviceConfig.setRumbleStrength(this@SettingsActivity, DeviceConfig.rumbleStrength(this@SettingsActivity) - 10)
+                render()
+            }
+        })
+        controlsRow.addView(Button(this).apply {
+            text = "+10%"
+            isFocusableInTouchMode = true
+            setOnClickListener {
+                DeviceConfig.setRumbleStrength(this@SettingsActivity, DeviceConfig.rumbleStrength(this@SettingsActivity) + 10)
+                render()
+            }
+        })
+        section.addView(controlsRow)
+        return section
     }
 
     private fun currentConfigView(): TextView = TextView(this).apply {

@@ -13,6 +13,22 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "0.1"
+        ndk {
+            // Shield TV Pro is arm64 — no need to ship other ABIs.
+            abiFilters += "arm64-v8a"
+        }
+        externalNativeBuild {
+            cmake {
+                cppFlags += ""
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     buildTypes {
