@@ -33,6 +33,7 @@ import rikka.shizuku.Shizuku
 
 private const val TAG = "GipBridge"
 private const val ACTION_USB_PERMISSION = "com.vanzetta.gipbridge.USB_PERMISSION"
+private const val ACTION_TEST_RUMBLE = "com.vanzetta.gipbridge.TEST_RUMBLE"
 private const val SHIZUKU_PERMISSION_REQUEST_CODE = 4242
 private const val XBOX_LONG_PRESS_MS = 500L
 private const val NOTIF_CHANNEL_ID = "gip_bridge_service"
@@ -149,6 +150,16 @@ class GipBridgeService : Service() {
         }
     }
 
+    // Fires a real GIP rumble packet straight at the controller, bypassing uinput/FF/RetroArch
+    // entirely — isolates whether a "rumble doesn't work" report is our GIP packet path or
+    // the RetroArch/Android InputDevice-vibrator integration layer.
+    private val testRumbleReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            log("Test rumble triggered.")
+            sendRumble(100, 100, 1000)
+        }
+    }
+
     private val usbAttachReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             val device: UsbDevice? = intent.getParcelableExtraCompat(UsbManager.EXTRA_DEVICE)
@@ -185,10 +196,12 @@ class GipBridgeService : Service() {
         val permFilter = IntentFilter(ACTION_USB_PERMISSION)
         val attachFilter = IntentFilter(UsbManager.ACTION_USB_DEVICE_ATTACHED)
         val detachFilter = IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED)
+        val testRumbleFilter = IntentFilter(ACTION_TEST_RUMBLE)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(usbPermissionReceiver, permFilter, Context.RECEIVER_NOT_EXPORTED)
             registerReceiver(usbAttachReceiver, attachFilter, Context.RECEIVER_NOT_EXPORTED)
             registerReceiver(usbDetachReceiver, detachFilter, Context.RECEIVER_NOT_EXPORTED)
+            registerReceiver(testRumbleReceiver, testRumbleFilter, Context.RECEIVER_NOT_EXPORTED)
         } else {
             @Suppress("UnspecifiedRegisterReceiverFlag")
             registerReceiver(usbPermissionReceiver, permFilter)
@@ -196,6 +209,8 @@ class GipBridgeService : Service() {
             registerReceiver(usbAttachReceiver, attachFilter)
             @Suppress("UnspecifiedRegisterReceiverFlag")
             registerReceiver(usbDetachReceiver, detachFilter)
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(testRumbleReceiver, testRumbleFilter)
         }
 
         Shizuku.addRequestPermissionResultListener(shizukuPermissionListener)
@@ -713,6 +728,7 @@ class GipBridgeService : Service() {
         runCatching { unregisterReceiver(usbPermissionReceiver) }
         runCatching { unregisterReceiver(usbAttachReceiver) }
         runCatching { unregisterReceiver(usbDetachReceiver) }
+        runCatching { unregisterReceiver(testRumbleReceiver) }
         runCatching { injector?.stopRumble() }
         runCatching { Shizuku.unbindUserService(userServiceArgs, userServiceConnection, true) }
         runCatching { Shizuku.removeRequestPermissionResultListener(shizukuPermissionListener) }

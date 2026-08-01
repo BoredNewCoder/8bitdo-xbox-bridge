@@ -136,6 +136,14 @@ class SettingsActivity : Activity() {
                 render()
             }
         })
+        controlsRow.addView(Button(this).apply {
+            text = "Test Rumble"
+            isFocusableInTouchMode = true
+            setOnClickListener {
+                sendBroadcast(android.content.Intent("com.vanzetta.gipbridge.TEST_RUMBLE").setPackage(packageName))
+                Toast.makeText(this@SettingsActivity, "Sent test rumble — should buzz for 1s", Toast.LENGTH_SHORT).show()
+            }
+        })
         section.addView(controlsRow)
         return section
     }
