@@ -28,8 +28,13 @@ that same wire protocol as an Android USB Host API client, then uses
 - System-wide input injection via Shizuku (works in any app, not just this one's own UI)
 - Runs as a foreground service — survives being backgrounded, and auto-reconnects on
   Shizuku restart
-- G733 Lightspeed dongle: turns off headband + earcup RGB lighting on connect (protocol
-  reverse-engineered by [YulCmr/G733_windows_app](https://github.com/YulCmr/G733_windows_app))
+- G733 Lightspeed dongle: turns off headband + earcup RGB lighting on connect AND on every
+  power-switch toggle (the dongle forgets the lights-off state on every power cycle, not
+  just a USB unplug — protocol reverse-engineered by
+  [YulCmr/G733_windows_app](https://github.com/YulCmr/G733_windows_app))
+- G733 battery percentage: toggling the headset's power switch shows a toast with current
+  battery % (and charging state) — same wire protocol as G HUB's own display, triggered
+  off a link-event report captured live rather than continuous polling
 
 ## What doesn't work
 

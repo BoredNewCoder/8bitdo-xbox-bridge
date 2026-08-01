@@ -26,6 +26,7 @@ import android.os.Looper
 import android.provider.Settings
 import android.util.Log
 import android.view.KeyEvent
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import kotlin.concurrent.thread
 import rikka.shizuku.Shizuku
@@ -122,7 +123,7 @@ class GipBridgeService : Service() {
                 val device: UsbDevice? = intent.getParcelableExtraCompat(UsbManager.EXTRA_DEVICE)
                 if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false) && device != null) {
                     log("USB permission granted for ${device.deviceName}")
-                    if (isHeadset(device)) turnOffG733Lights(device)
+                    if (isHeadset(device)) startG733Session(device)
                     else if (isController(device)) startGipSession(device)
                 } else {
                     log("USB permission DENIED")
@@ -206,7 +207,7 @@ class GipBridgeService : Service() {
 
     private fun requestPermissionAndConnect(device: UsbDevice) {
         if (usbManager.hasPermission(device)) {
-            if (isHeadset(device)) turnOffG733Lights(device) else if (isController(device)) startGipSession(device)
+            if (isHeadset(device)) startG733Session(device) else if (isController(device)) startGipSession(device)
             return
         }
         val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_MUTABLE else 0
@@ -435,38 +436,170 @@ class GipBridgeService : Service() {
     // 0x11, feature 0x04, sub-command 0x3e, side byte, mode byte) reverse-engineered by
     // github.com/YulCmr/G733_windows_app against real hardware — the dongle has no
     // persistent memory for this, so it must be re-sent every time it's plugged in/powered on.
-    private fun turnOffG733Lights(device: UsbDevice) {
+    @Volatile private var g733Running = false
+    private var g733ReaderThread: Thread? = null
+    private var g733Connection: UsbDeviceConnection? = null
+    private var g733HidIface: UsbInterface? = null
+    @Volatile private var g733AnnouncePending = false
+
+    private fun startG733Session(device: UsbDevice) {
+        if (g733Running) { log("G733 session already running, ignoring duplicate start."); return }
+
         val hidIface: UsbInterface? = (0 until device.interfaceCount)
             .map { device.getInterface(it) }
             .firstOrNull { it.interfaceClass == UsbConstants.USB_CLASS_HID }
         if (hidIface == null) { log("G733: HID interface not found"); return }
 
+        // Captured live via `adb shell dumpsys usb`: interface class=3 (HID) has only an
+        // IN endpoint (address 0x83) — no OUT endpoint, so output reports (lights, battery
+        // query) go via a SET_REPORT control transfer, but reading responses (battery level,
+        // power state) needs this IN endpoint same as any other USB read.
+        var epIn: UsbEndpoint? = null
+        for (i in 0 until hidIface.endpointCount) {
+            val ep = hidIface.getEndpoint(i)
+            if (ep.direction == UsbConstants.USB_DIR_IN) epIn = ep
+        }
+        if (epIn == null) { log("G733: IN endpoint not found"); return }
+
         val connection = usbManager.openDevice(device)
         if (connection == null) { log("G733: openDevice failed"); return }
         if (!connection.claimInterface(hidIface, true)) { log("G733: claimInterface failed"); return }
 
-        val reportIdOutput = 0x11
-        val hidSetReport = 0x09
-        val hidReportTypeOutput = 0x02
-        val controlRequestType = 0x21 // host-to-device | class | interface
+        g733Connection = connection
+        g733HidIface = hidIface
 
-        fun sendLightsOff(side: Int) {
-            val out = ByteArray(20)
-            out[0] = reportIdOutput.toByte()
-            out[1] = 0xff.toByte()
-            out[2] = 0x04
-            out[3] = 0x3e
-            out[4] = side.toByte()
-            out[5] = 0x00 // mode = off
-            val value = (hidReportTypeOutput shl 8) or reportIdOutput
-            val n = connection.controlTransfer(controlRequestType, hidSetReport, value, hidIface.id, out, out.size, 1000)
-            log("G733: lights-off (side=$side) sent, result=$n")
+        sendG733LightsOff(connection, hidIface, 0x00) // bottom zone
+        sendG733LightsOff(connection, hidIface, 0x01) // top zone
+        sendG733BatteryQuery(connection, hidIface)
+
+        log("G733 session started. IN ep=0x${epIn.address.toString(16)}. Listening for status reports...")
+        g733Running = true
+        g733ReaderThread = thread(name = "g733-reader") { g733ReadLoop(connection, epIn) }
+    }
+
+    private fun g733ReadLoop(conn: UsbDeviceConnection, epIn: UsbEndpoint) {
+        val buf = ByteArray(64)
+        while (g733Running) {
+            val n = conn.bulkTransfer(epIn, buf, buf.size, 2000)
+            if (n <= 0) continue
+            val data = buf.copyOf(n)
+            parseG733Report(data)
         }
+        log("G733 read loop stopped.")
+    }
 
-        sendLightsOff(0x00) // bottom zone
-        sendLightsOff(0x01) // top zone
-        connection.releaseInterface(hidIface)
-        connection.close()
+    // Protocol (report id 0x11, feature 0x08 = battery, sub-command 0x0f = query) and the
+    // voltage->percent formula reverse-engineered by github.com/YulCmr/G733_windows_app
+    // against real hardware. Confirmed live: this dongle only returns real telemetry after
+    // the headset's wireless link has been freshly (re)established — querying while the
+    // link is idle gets a fixed echo/ack instead of live voltage.
+    //
+    // IMPORTANT: this interface echoes back EVERY command we send (confirmed live for both
+    // the battery query and the lights-off command). An earlier version of this function
+    // treated "anything that isn't a battery response" as a power/link event — which caught
+    // our own echoes too, and since reacting to an event means SENDING more commands, that
+    // caused an infinite feedback loop (echo -> treated as event -> resend -> new echo ->
+    // ...). Fixed by allowlisting only the specific byte patterns actually observed
+    // correlating with a physical power-switch toggle, rather than blocklisting echoes
+    // (which would need updating every time a new command is added here).
+    private fun parseG733Report(data: ByteArray) {
+        val isBatteryResponse = data.size >= 7 &&
+            (data[2].toInt() and 0xFF) == 0x08 && (data[3].toInt() and 0xF0) == 0x00
+        // Captured live coinciding with physical power-switch toggles: a short 5-byte
+        // `01 00 00 00 00`, and a pair of 20-byte reports with feature byte 0x05.
+        val isPowerEvent = data.size <= 5 ||
+            (data.size >= 3 && (data[2].toInt() and 0xFF) == 0x05)
+
+        if (isBatteryResponse) {
+            val voltage = ((data[4].toInt() and 0xFF) shl 8) or (data[5].toInt() and 0xFF)
+            val plugged = when (data[6].toInt() and 0xFF) {
+                0x01 -> false
+                0x03, 0x07 -> true
+                else -> null
+            }
+            if (voltage == 0) { log("G733: battery report but voltage=0 (disconnected?)"); return }
+            val percent = (0.1667 * voltage - 608.33).toInt().coerceIn(0, 100)
+            log("G733 BATTERY: ${percent}% (${voltage}mV)${if (plugged == true) " [charging]" else ""}")
+            if (g733AnnouncePending) {
+                g733AnnouncePending = false
+                announceG733Battery(percent, plugged == true)
+            }
+        } else if (isPowerEvent) {
+            log("G733 power event: ${data.toHex()}")
+            val conn = g733Connection
+            val iface = g733HidIface
+            if (conn != null && iface != null) {
+                // The headset forgets lights-off on every power cycle, not just a dongle
+                // unplug/replug — re-apply it on the same link event used for the battery
+                // announce, so turning the headset off and back on doesn't bring lights back.
+                //
+                // A control-transfer "success" here only confirms the dongle received the
+                // command, not that the wireless RF link to the headset itself has finished
+                // re-establishing (confirmed live: this event can fire while a battery query
+                // still reads voltage=0/disconnected). Sending immediately can silently get
+                // dropped, so send now AND again after a delay once the link has had time to
+                // settle — same double-send used at initial connect, just retried.
+                runCatching { sendG733LightsOff(conn, iface, 0x00) }
+                runCatching { sendG733LightsOff(conn, iface, 0x01) }
+                g733AnnouncePending = true
+                runCatching { sendG733BatteryQuery(conn, iface) }
+
+                thread(name = "g733-lights-retry") {
+                    Thread.sleep(2000)
+                    if (g733Running) {
+                        runCatching { sendG733LightsOff(conn, iface, 0x00) }
+                        runCatching { sendG733LightsOff(conn, iface, 0x01) }
+                    }
+                }
+            }
+        } else {
+            // Echo of our own command, or an unrecognized report — log only, no action.
+            // Reacting here (sending more commands) is what caused the earlier feedback loop.
+            log("G733 report: ${data.toHex()}")
+        }
+    }
+
+    private var g733BatteryToast: Toast? = null
+
+    // Toasts shown from a Service (no foreground Activity actively displaying it) can fail
+    // to auto-dismiss on Android TV — confirmed live, one stayed on screen indefinitely.
+    // Cancelling explicitly on a timer instead of trusting LENGTH_LONG's own timeout.
+    private fun announceG733Battery(percent: Int, charging: Boolean) {
+        mainHandler.post {
+            g733BatteryToast?.cancel()
+            val toast = Toast.makeText(
+                this,
+                "G733 battery: $percent%${if (charging) " (charging)" else ""}",
+                Toast.LENGTH_LONG,
+            )
+            g733BatteryToast = toast
+            toast.show()
+            mainHandler.postDelayed({ toast.cancel() }, 3500)
+        }
+    }
+
+    private fun sendG733BatteryQuery(connection: UsbDeviceConnection, hidIface: UsbInterface) {
+        val out = ByteArray(20)
+        out[0] = 0x11
+        out[1] = 0xff.toByte()
+        out[2] = 0x08
+        out[3] = 0x0f
+        val value = (0x02 shl 8) or 0x11 // report type OUTPUT (2), report id 0x11
+        val n = connection.controlTransfer(0x21, 0x09, value, hidIface.id, out, out.size, 1000)
+        log("G733: battery query sent, result=$n")
+    }
+
+    private fun sendG733LightsOff(connection: UsbDeviceConnection, hidIface: UsbInterface, side: Int) {
+        val out = ByteArray(20)
+        out[0] = 0x11
+        out[1] = 0xff.toByte()
+        out[2] = 0x04
+        out[3] = 0x3e
+        out[4] = side.toByte()
+        out[5] = 0x00 // mode = off
+        val value = (0x02 shl 8) or 0x11
+        val n = connection.controlTransfer(0x21, 0x09, value, hidIface.id, out, out.size, 1000)
+        log("G733: lights-off (side=$side) sent, result=$n")
     }
 
     private fun log(msg: String) {
@@ -482,6 +615,8 @@ class GipBridgeService : Service() {
     override fun onDestroy() {
         running = false
         readerThread?.join(500)
+        g733Running = false
+        g733ReaderThread?.join(500)
         runCatching { unregisterReceiver(usbPermissionReceiver) }
         runCatching { unregisterReceiver(usbAttachReceiver) }
         runCatching { Shizuku.unbindUserService(userServiceArgs, userServiceConnection, true) }
