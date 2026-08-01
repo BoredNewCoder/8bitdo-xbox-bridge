@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 8BitDo Ultimate Wired Controller for Xbox — captured live via dumpsys usb -->
+    <usb-device vendor-id="11720" product-id="8213" />
+    <!-- Logitech G733 Lightspeed dongle — captured live via dumpsys usb -->
+    <usb-device vendor-id="1133" product-id="2741" />
+</resources>

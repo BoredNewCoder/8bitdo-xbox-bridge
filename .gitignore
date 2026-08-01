@@ -1,0 +1,18 @@
+.gradle/
+.kotlin/
+build/
+app/build/
+local.properties
+*.png
+shizuku.apk
+
+# IJFW project memory (local tooling artifacts, not part of the project)
+.ijfw/
+ijfw/
+AGENTS.md
+CLAUDE.md
+
+# xone driver source fetched locally for protocol reference during development —
+# GPL-2.0-or-later, not redistributed here; see README credits instead.
+_ref_*.c
+_ref_*.h
