@@ -23,7 +23,6 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.provider.Settings
 import android.util.Log
 import android.view.KeyEvent
 import android.widget.Toast
@@ -79,9 +78,17 @@ class GipBridgeService : Service() {
     private val xboxLongPressRunnable = Runnable {
         xboxLongPressFired = true
         log("XBOX BUTTON: held -> opening Settings")
+        // Confirmed live: startActivity(ACTION_SETTINGS) from here gets silently blocked by
+        // Android's background-activity-launch restriction ("Background activity start...
+        // isCallingUidForeground: false") — a foreground Service has no visible window, so it
+        // doesn't qualify to launch an Activity directly, even though HOME short-press (a key
+        // *injection*, not an activity start) works fine from the same context. KEYCODE_SETTINGS
+        // is a real system key the framework itself intercepts to open Settings, so routing it
+        // through the same injection path used for HOME sidesteps the restriction entirely.
         runCatching {
-            startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-        }.onFailure { log("Settings launch failed: ${it.message}") }
+            injector?.injectKey(KeyEvent.KEYCODE_SETTINGS, true)
+            injector?.injectKey(KeyEvent.KEYCODE_SETTINGS, false)
+        }.onFailure { log("Settings key injection failed: ${it.message}") }
     }
 
     private val userServiceArgs = Shizuku.UserServiceArgs(
