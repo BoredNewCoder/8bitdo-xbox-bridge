@@ -31,10 +31,6 @@ import kotlin.concurrent.thread
 import rikka.shizuku.Shizuku
 
 private const val TAG = "GipBridge"
-private const val VENDOR_ID_8BITDO = 11720
-private const val PRODUCT_ID_ULTIMATE_XBOX = 8213
-private const val VENDOR_ID_LOGITECH = 1133
-private const val PRODUCT_ID_G733 = 2741
 private const val ACTION_USB_PERMISSION = "com.vanzetta.gipbridge.USB_PERMISSION"
 private const val SHIZUKU_PERMISSION_REQUEST_CODE = 4242
 private const val XBOX_LONG_PRESS_MS = 500L
@@ -63,6 +59,13 @@ class GipBridgeService : Service() {
     private lateinit var usbManager: UsbManager
     private var readerThread: Thread? = null
     @Volatile private var running = false
+
+    // Read fresh each call (not cached) so a config change via SettingsActivity takes
+    // effect on the next USB attach event without needing a service restart.
+    private fun isController(device: UsbDevice) =
+        device.vendorId == DeviceConfig.controllerVid(this) && device.productId == DeviceConfig.controllerPid(this)
+    private fun isHeadset(device: UsbDevice) =
+        device.vendorId == DeviceConfig.headsetVid(this) && device.productId == DeviceConfig.headsetPid(this)
 
     @Volatile private var injector: IGamepadInjector? = null
     private var lastButtons = 0
@@ -119,8 +122,8 @@ class GipBridgeService : Service() {
                 val device: UsbDevice? = intent.getParcelableExtraCompat(UsbManager.EXTRA_DEVICE)
                 if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false) && device != null) {
                     log("USB permission granted for ${device.deviceName}")
-                    if (device.vendorId == VENDOR_ID_LOGITECH) turnOffG733Lights(device)
-                    else startGipSession(device)
+                    if (isHeadset(device)) turnOffG733Lights(device)
+                    else if (isController(device)) startGipSession(device)
                 } else {
                     log("USB permission DENIED")
                 }
@@ -131,7 +134,7 @@ class GipBridgeService : Service() {
     private val usbAttachReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             val device: UsbDevice? = intent.getParcelableExtraCompat(UsbManager.EXTRA_DEVICE)
-            if (device != null && (device.vendorId == VENDOR_ID_8BITDO || device.vendorId == VENDOR_ID_LOGITECH)) {
+            if (device != null && (isController(device) || isHeadset(device))) {
                 log("Attach event: ${device.deviceName} (vid=${device.vendorId} pid=${device.productId})")
                 requestPermissionAndConnect(device)
             }
@@ -159,7 +162,11 @@ class GipBridgeService : Service() {
         Shizuku.addRequestPermissionResultListener(shizukuPermissionListener)
         Shizuku.addBinderReceivedListenerSticky { setupShizuku() }
 
-        log("GIP Bridge service started. Looking for 8BitDo device (vid=$VENDOR_ID_8BITDO)...")
+        log(
+            "GIP Bridge service started. Looking for controller " +
+                "(vid=${DeviceConfig.controllerVid(this)} pid=${DeviceConfig.controllerPid(this)}) " +
+                "and headset (vid=${DeviceConfig.headsetVid(this)} pid=${DeviceConfig.headsetPid(this)})..."
+        )
         findAndConnectExisting()
     }
 
@@ -186,9 +193,7 @@ class GipBridgeService : Service() {
     }
 
     private fun findAndConnectExisting() {
-        val targets = usbManager.deviceList.values.filter {
-            it.vendorId == VENDOR_ID_8BITDO || it.vendorId == VENDOR_ID_LOGITECH
-        }
+        val targets = usbManager.deviceList.values.filter { isController(it) || isHeadset(it) }
         if (targets.isEmpty()) {
             log("No target device currently attached. Plug it in (attach receiver will catch it).")
             return
@@ -201,7 +206,7 @@ class GipBridgeService : Service() {
 
     private fun requestPermissionAndConnect(device: UsbDevice) {
         if (usbManager.hasPermission(device)) {
-            if (device.vendorId == VENDOR_ID_LOGITECH) turnOffG733Lights(device) else startGipSession(device)
+            if (isHeadset(device)) turnOffG733Lights(device) else if (isController(device)) startGipSession(device)
             return
         }
         val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_MUTABLE else 0

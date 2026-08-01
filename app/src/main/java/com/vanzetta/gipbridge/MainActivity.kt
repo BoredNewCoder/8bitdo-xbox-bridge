@@ -7,6 +7,8 @@ import android.content.Intent
 import android.content.ServiceConnection
 import android.os.Bundle
 import android.os.IBinder
+import android.widget.Button
+import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.core.content.ContextCompat
@@ -48,8 +50,21 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
 
         logView = TextView(this).apply { textSize = 12f; setPadding(24, 24, 24, 24) }
-        scroll = ScrollView(this).apply { addView(logView) }
-        setContentView(scroll)
+        // Read-only log display — not focusable, so it can't steal D-pad focus from the
+        // button below on Android TV (a focusable ScrollView otherwise grabs default focus
+        // and eats D-pad UP/DOWN as scroll gestures instead of releasing it to siblings).
+        scroll = ScrollView(this).apply { addView(logView); isFocusable = false; isFocusableInTouchMode = false }
+
+        val configButton = Button(this).apply {
+            text = "Configure Devices"
+            setOnClickListener { startActivity(Intent(this@MainActivity, SettingsActivity::class.java)) }
+        }
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(configButton)
+            addView(scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+        }
+        setContentView(root)
 
         val svcIntent = Intent(this, GipBridgeService::class.java)
         ContextCompat.startForegroundService(this, svcIntent)

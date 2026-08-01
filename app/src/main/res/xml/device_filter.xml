@@ -1,7 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- 8BitDo Ultimate Wired Controller for Xbox — captured live via dumpsys usb -->
-    <usb-device vendor-id="11720" product-id="8213" />
-    <!-- Logitech G733 Lightspeed dongle — captured live via dumpsys usb -->
-    <usb-device vendor-id="1133" product-id="2741" />
+    <!-- Matches ANY attached USB device so the app auto-launches regardless of which
+         controller/headset VID:PID is configured (see DeviceConfig.kt / SettingsActivity) —
+         the app's own runtime logic then checks against the configured pair and does
+         nothing if it's not a match. Standard pattern for USB host apps whose exact
+         target hardware isn't fixed at build time. -->
+    <usb-device />
 </resources>

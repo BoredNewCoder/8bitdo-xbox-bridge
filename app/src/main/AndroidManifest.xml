@@ -28,6 +28,11 @@
                 android:resource="@xml/device_filter" />
         </activity>
 
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:label="GIP Bridge Settings" />
+
         <service
             android:name=".GipBridgeService"
             android:exported="false"
