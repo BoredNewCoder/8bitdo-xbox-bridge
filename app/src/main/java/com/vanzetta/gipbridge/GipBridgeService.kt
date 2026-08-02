@@ -34,6 +34,7 @@ private const val TAG = "GipBridge"
 private const val ACTION_USB_PERMISSION = "com.vanzetta.gipbridge.USB_PERMISSION"
 private const val ACTION_TEST_RUMBLE = "com.vanzetta.gipbridge.TEST_RUMBLE"
 private const val ACTION_TEST_SELECT_HOLD = "com.vanzetta.gipbridge.TEST_SELECT_HOLD"
+private const val ACTION_TEST_NAV = "com.vanzetta.gipbridge.TEST_NAV"
 private const val SHIZUKU_PERMISSION_REQUEST_CODE = 4242
 private const val XBOX_LONG_PRESS_MS = 500L
 private const val NOTIF_CHANNEL_ID = "gip_bridge_service"
@@ -203,6 +204,37 @@ class GipBridgeService : Service() {
         }
     }
 
+    // Generic remote nav test — extra "key" one of UP/DOWN/LEFT/RIGHT/A/B/START/SELECT,
+    // injected through the real uinput device (same path as a physical press) so RetroArch's
+    // menu can actually be driven blind via adb, using screenshots for feedback instead of a
+    // physically-present controller.
+    private val testNavReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val key = intent.getStringExtra("key") ?: return
+            log("Test nav: $key")
+            val inj = injector ?: return
+            runCatching {
+                when (key) {
+                    "UP" -> { inj.injectAxes(0f, 0f, 0f, 0f, 0f, 0f, 0f, -1f); Thread.sleep(150); inj.injectAxes(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f) }
+                    "DOWN" -> { inj.injectAxes(0f, 0f, 0f, 0f, 0f, 0f, 0f, 1f); Thread.sleep(150); inj.injectAxes(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f) }
+                    "LEFT" -> { inj.injectAxes(0f, 0f, 0f, 0f, 0f, 0f, -1f, 0f); Thread.sleep(150); inj.injectAxes(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f) }
+                    "RIGHT" -> { inj.injectAxes(0f, 0f, 0f, 0f, 0f, 0f, 1f, 0f); Thread.sleep(150); inj.injectAxes(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f) }
+                    "A" -> { inj.injectKey(KeyEvent.KEYCODE_BUTTON_A, true); Thread.sleep(100); inj.injectKey(KeyEvent.KEYCODE_BUTTON_A, false) }
+                    "B" -> { inj.injectKey(KeyEvent.KEYCODE_BUTTON_B, true); Thread.sleep(100); inj.injectKey(KeyEvent.KEYCODE_BUTTON_B, false) }
+                    "START" -> { inj.injectKey(KeyEvent.KEYCODE_BUTTON_START, true); Thread.sleep(100); inj.injectKey(KeyEvent.KEYCODE_BUTTON_START, false) }
+                    "SELECT" -> { inj.injectKey(KeyEvent.KEYCODE_BUTTON_SELECT, true); Thread.sleep(100); inj.injectKey(KeyEvent.KEYCODE_BUTTON_SELECT, false) }
+                }
+            }.onFailure { log("Test nav failed: ${it.message}") }
+        }
+    }
+
+    private val testEnableRumbleReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            DeviceConfig.setRumbleEnabled(this@GipBridgeService, true)
+            log("Rumble force-enabled via broadcast. Now: ${DeviceConfig.rumbleEnabled(this@GipBridgeService)}")
+        }
+    }
+
     private val usbAttachReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             val device: UsbDevice? = intent.getParcelableExtraCompat(UsbManager.EXTRA_DEVICE)
@@ -241,12 +273,16 @@ class GipBridgeService : Service() {
         val detachFilter = IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED)
         val testRumbleFilter = IntentFilter(ACTION_TEST_RUMBLE)
         val testSelectHoldFilter = IntentFilter(ACTION_TEST_SELECT_HOLD)
+        val testNavFilter = IntentFilter(ACTION_TEST_NAV)
+        val testEnableRumbleFilter = IntentFilter("com.vanzetta.gipbridge.TEST_ENABLE_RUMBLE")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(usbPermissionReceiver, permFilter, Context.RECEIVER_NOT_EXPORTED)
             registerReceiver(usbAttachReceiver, attachFilter, Context.RECEIVER_NOT_EXPORTED)
             registerReceiver(usbDetachReceiver, detachFilter, Context.RECEIVER_NOT_EXPORTED)
             registerReceiver(testRumbleReceiver, testRumbleFilter, Context.RECEIVER_NOT_EXPORTED)
             registerReceiver(testSelectHoldReceiver, testSelectHoldFilter, Context.RECEIVER_NOT_EXPORTED)
+            registerReceiver(testNavReceiver, testNavFilter, Context.RECEIVER_NOT_EXPORTED)
+            registerReceiver(testEnableRumbleReceiver, testEnableRumbleFilter, Context.RECEIVER_NOT_EXPORTED)
         } else {
             @Suppress("UnspecifiedRegisterReceiverFlag")
             registerReceiver(usbPermissionReceiver, permFilter)
@@ -258,6 +294,10 @@ class GipBridgeService : Service() {
             registerReceiver(testRumbleReceiver, testRumbleFilter)
             @Suppress("UnspecifiedRegisterReceiverFlag")
             registerReceiver(testSelectHoldReceiver, testSelectHoldFilter)
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(testNavReceiver, testNavFilter)
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(testEnableRumbleReceiver, testEnableRumbleFilter)
         }
 
         Shizuku.addRequestPermissionResultListener(shizukuPermissionListener)
@@ -549,9 +589,9 @@ class GipBridgeService : Service() {
     // strongPercent/weakPercent are 0-100, scaled down further by the user's configured
     // rumble strength. durationMs=0 sends an explicit stop (all motors off).
     private fun sendRumble(strongPercent: Int, weakPercent: Int, durationMs: Int, motors: Int = GipMotor.ALL) {
-        val conn = gipConnection ?: return
-        val epOut = gipEpOut ?: return
-        if (durationMs > 0 && !DeviceConfig.rumbleEnabled(this)) return
+        val conn = gipConnection ?: run { log("sendRumble: no gipConnection, skipping"); return }
+        val epOut = gipEpOut ?: run { log("sendRumble: no gipEpOut, skipping"); return }
+        if (durationMs > 0 && !DeviceConfig.rumbleEnabled(this)) { log("sendRumble: rumble disabled in settings, skipping"); return }
 
         val userStrength = DeviceConfig.rumbleStrength(this)
         val left = (strongPercent * userStrength / 100).coerceIn(0, 100)
@@ -559,6 +599,7 @@ class GipBridgeService : Service() {
         val durationTens = (durationMs / 10).coerceIn(0, 255)
 
         val payload = buildRumblePayload(motors = motors, leftTrigger = left, rightTrigger = right, left = left, right = right, durationTens = durationTens)
+        log("sendRumble: motors=0x${motors.toString(16)} left=$left right=$right durationTens=$durationTens payload=${payload.toHex()}")
         val hdr = GipHeader(
             command = GipCommand.RUMBLE,
             options = 0, // per xone's gip_send_rumble: clientId only, no INTERNAL flag
@@ -777,6 +818,8 @@ class GipBridgeService : Service() {
         runCatching { unregisterReceiver(usbDetachReceiver) }
         runCatching { unregisterReceiver(testRumbleReceiver) }
         runCatching { unregisterReceiver(testSelectHoldReceiver) }
+        runCatching { unregisterReceiver(testNavReceiver) }
+        runCatching { unregisterReceiver(testEnableRumbleReceiver) }
         runCatching { injector?.stopRumble() }
         runCatching { Shizuku.unbindUserService(userServiceArgs, userServiceConnection, true) }
         runCatching { Shizuku.removeRequestPermissionResultListener(shizukuPermissionListener) }
