@@ -24,8 +24,21 @@ that same wire protocol as an Android USB Host API client, then uses
 ## What works
 
 - Full button/stick/trigger mapping — A/B/X/Y, bumpers, triggers, both analog sticks, D-pad
-- Xbox/Guide button: short press → Home, hold ~500ms → Settings
-- System-wide input injection via Shizuku (works in any app, not just this one's own UI)
+- Xbox/Guide button: short press → Home, hold ~500ms → Settings (opened via a real `am
+  start` call from the Shizuku shell-UID process — a plain `Context.startActivity()` from
+  the app itself gets silently blocked by Android's background-activity-launch restriction)
+- **Real rumble/force-feedback support**, including in emulators (e.g. RetroArch) — a real
+  Linux `uinput` virtual gamepad is created from the Shizuku shell-UID process (buttons,
+  axes, and force-feedback all through one real Android `InputDevice`, not synthetic
+  injection), so anything that calls `InputDevice.getVibrator()` — including RetroArch's
+  own Android rumble path — routes through to the real controller motors over the existing
+  GIP connection. Configurable in-app: on/off toggle + strength (10% steps) under
+  **Configure Devices**. The two GIP trigger motors (impulse triggers) aren't reachable this
+  way since the standard Linux `FF_RUMBLE` effect only carries two channels (main
+  strong/weak) — real games can't address them, only this app's own manual test can
+- System-wide input injection via a real uinput device (works in any app, not just this
+  one's own UI) — see "Rumble/input architecture" below for why this replaced the earlier
+  `InputManager.injectInputEvent`-based approach
 - Runs as a foreground service — survives being backgrounded, and auto-reconnects on
   Shizuku restart
 - G733 Lightspeed dongle: turns off headband + earcup RGB lighting on connect AND on every
@@ -52,6 +65,34 @@ that same wire protocol as an Android USB Host API client, then uses
   prompts from the same process, not something fixable cleanly from app code. Workaround:
   force-stop the app and reopen it (Android TV Settings → Apps → GIP Bridge → Force stop).
   A first-time attach in a fresh app launch always works.
+
+## Rumble/input architecture
+
+Buttons, sticks, and rumble all go through one real Linux `uinput` virtual gamepad, created
+by the Shizuku shell-UID process (`GamepadInjectorService`, native code in
+`app/src/main/cpp/uinput_gamepad.c`) — not through `InputManager.injectInputEvent`. That
+earlier synthetic-injection approach worked fine for buttons/sticks but had no path to
+rumble at all: apps that check which real `InputDevice` a button event came from (RetroArch
+included) see synthetic injected events as device id `-1`, a sentinel most rumble code paths
+explicitly skip. A real uinput device gives buttons/axes/FF a real device id everything can
+see, at the cost of needing correct raw evdev button/axis codes instead of Android's
+higher-level `KeyEvent`/`MotionEvent` constants.
+
+GIP rumble packets (`buildRumblePayload` in `GipProtocol.kt`) are built from `xone`'s real
+driver struct (`struct gip_gamepad_pkt_rumble`, `driver/gamepad.c`) and sent over the
+existing GIP USB connection whenever the uinput device receives a real Linux force-feedback
+upload/play event, polled off the same fd the device was created on
+(`nativePollFF` in `uinput_gamepad.c`).
+
+**Known Android-TV-specific quirk worth knowing if you fork this for other hardware:** this
+device's vendor/product ID (`0x045e`/`0x02fd`, chosen to read as a real Xbox controller to
+apps) happened to match a genuine Xbox `.kl` (key layout) file already on this specific
+Shield unit — confirmed by reading `/system/usr/keylayout/Vendor_045e_Product_02fd.kl`
+directly off the device. That file maps the View/Select button to raw `KEY_BACK` (158), not
+the generic joystick `BTN_SELECT` (0x13a) code — sending the "obvious" code silently
+produced a button press Android had no rule for. If buttons don't register correctly on
+different hardware, check whether a matching `.kl` file exists on that device and what it
+actually expects.
 
 ## Requirements
 

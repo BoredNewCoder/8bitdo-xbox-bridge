@@ -9,9 +9,6 @@ import android.view.InputEvent
 import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.MotionEvent
-import android.content.Context
-import android.content.Intent
-import android.provider.Settings
 import kotlin.concurrent.thread
 
 private const val TAG = "GipInjector"
@@ -187,11 +184,18 @@ class GamepadInjectorService : IGamepadInjector.Stub() {
     // Android's background-activity-launch restriction), the shell UID has the same
     // activity-start privileges `adb shell am start` has used successfully throughout this
     // whole session.
+    // Context.startActivity() from here fails with "Permission Denial: package=<app>
+    // does not belong to uid=2000" -- confirmed live -- because this Context still carries
+    // our app's registered package identity even though the process actually runs as shell
+    // (uid 2000), and Android's ActivityManager checks that they match. Shelling out to the
+    // real `am` binary instead sidesteps that entirely: it's an external process with its own
+    // correctly-configured shell identity, doing the exact same AIDL call `adb shell am start`
+    // has used successfully all session -- no Context/package mismatch involved at all.
     override fun openSettings() {
         runCatching {
-            val activityThread = Class.forName("android.app.ActivityThread")
-            val context = activityThread.getMethod("currentApplication").invoke(null) as Context
-            context.startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            ProcessBuilder("am", "start", "-a", "android.settings.SETTINGS")
+                .redirectErrorStream(true)
+                .start()
         }.onFailure { Log.e(TAG, "openSettings failed: ${it.message}") }
     }
 
