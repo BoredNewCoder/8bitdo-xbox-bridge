@@ -33,6 +33,7 @@ import rikka.shizuku.Shizuku
 private const val TAG = "GipBridge"
 private const val ACTION_USB_PERMISSION = "com.vanzetta.gipbridge.USB_PERMISSION"
 private const val ACTION_TEST_RUMBLE = "com.vanzetta.gipbridge.TEST_RUMBLE"
+private const val ACTION_TEST_SELECT_HOLD = "com.vanzetta.gipbridge.TEST_SELECT_HOLD"
 private const val SHIZUKU_PERMISSION_REQUEST_CODE = 4242
 private const val XBOX_LONG_PRESS_MS = 500L
 private const val NOTIF_CHANNEL_ID = "gip_bridge_service"
@@ -184,6 +185,24 @@ class GipBridgeService : Service() {
         }
     }
 
+    // Holds SELECT through our own uinput device for real, the same path a physical press
+    // takes — adb's `input keyevent` injects via a totally different, generic system-level
+    // path (not through our device's real InputDevice id at all), which is almost certainly
+    // why remote testing of RetroArch's SELECT-hold menu combo (input_menu_toggle_gamepad_combo
+    // = HOLD_SELECT, confirmed from the live cfg) never worked.
+    private val testSelectHoldReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            log("Test SELECT hold (via real uinput device) triggered.")
+            thread(name = "test-select-hold") {
+                runCatching {
+                    injector?.injectKey(KeyEvent.KEYCODE_BUTTON_SELECT, true)
+                    Thread.sleep(2500)
+                    injector?.injectKey(KeyEvent.KEYCODE_BUTTON_SELECT, false)
+                }.onFailure { log("Test SELECT hold failed: ${it.message}") }
+            }
+        }
+    }
+
     private val usbAttachReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             val device: UsbDevice? = intent.getParcelableExtraCompat(UsbManager.EXTRA_DEVICE)
@@ -221,11 +240,13 @@ class GipBridgeService : Service() {
         val attachFilter = IntentFilter(UsbManager.ACTION_USB_DEVICE_ATTACHED)
         val detachFilter = IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED)
         val testRumbleFilter = IntentFilter(ACTION_TEST_RUMBLE)
+        val testSelectHoldFilter = IntentFilter(ACTION_TEST_SELECT_HOLD)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(usbPermissionReceiver, permFilter, Context.RECEIVER_NOT_EXPORTED)
             registerReceiver(usbAttachReceiver, attachFilter, Context.RECEIVER_NOT_EXPORTED)
             registerReceiver(usbDetachReceiver, detachFilter, Context.RECEIVER_NOT_EXPORTED)
             registerReceiver(testRumbleReceiver, testRumbleFilter, Context.RECEIVER_NOT_EXPORTED)
+            registerReceiver(testSelectHoldReceiver, testSelectHoldFilter, Context.RECEIVER_NOT_EXPORTED)
         } else {
             @Suppress("UnspecifiedRegisterReceiverFlag")
             registerReceiver(usbPermissionReceiver, permFilter)
@@ -235,6 +256,8 @@ class GipBridgeService : Service() {
             registerReceiver(usbDetachReceiver, detachFilter)
             @Suppress("UnspecifiedRegisterReceiverFlag")
             registerReceiver(testRumbleReceiver, testRumbleFilter)
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(testSelectHoldReceiver, testSelectHoldFilter)
         }
 
         Shizuku.addRequestPermissionResultListener(shizukuPermissionListener)
@@ -753,6 +776,7 @@ class GipBridgeService : Service() {
         runCatching { unregisterReceiver(usbAttachReceiver) }
         runCatching { unregisterReceiver(usbDetachReceiver) }
         runCatching { unregisterReceiver(testRumbleReceiver) }
+        runCatching { unregisterReceiver(testSelectHoldReceiver) }
         runCatching { injector?.stopRumble() }
         runCatching { Shizuku.unbindUserService(userServiceArgs, userServiceConnection, true) }
         runCatching { Shizuku.removeRequestPermissionResultListener(shizukuPermissionListener) }
