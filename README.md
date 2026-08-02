@@ -94,6 +94,34 @@ produced a button press Android had no rule for. If buttons don't register corre
 different hardware, check whether a matching `.kl` file exists on that device and what it
 actually expects.
 
+### Troubleshooting: rumble works, then silently stops
+
+Check this app's own **Configure Devices** screen first — the rumble on/off toggle there is
+a real, easy-to-forget-about switch, and was the actual cause the one time this exact
+symptom came up during development (spent a while chasing RetroArch/uinput theories before
+finding the toggle was just off). `sendRumble()` logs `"rumble disabled in settings,
+skipping"` on every attempt when this is the cause — check logcat for that line before
+anything else.
+
+Two more settings that live in **RetroArch's own config**, not this app, can each
+independently kill rumble with zero visible error — if RetroArch is ever reinstalled, has
+its data wiped, or a config gets reset, check these next:
+
+- **`enable_device_vibration` in `retroarch.cfg`** (`Android/data/com.retroarch.aarch64/files/retroarch.cfg`)
+  — if `"true"`, RetroArch routes rumble to a whole-device vibrator sentinel (`id = -1`)
+  meant for phones/tablets, which doesn't exist on a set-top box. Rumble calls silently
+  no-op instead of reaching any real controller. Should be `"false"` (or absent, since that's
+  also the effective default). Seen live: this key isn't exposed in any RetroArch menu —
+  confirmed by grepping RetroArch's own menu string tables and finding no label for it — so
+  if it's on, something set it programmatically (possibly RetroArch's own first-time device
+  detection), not a setting you toggled on purpose.
+- **The emulator core's own rumble/vibration option** — e.g. for PS1 via SwanStation,
+  `swanstation_Controller_EnableRumble` in
+  `RetroArch/config/SwanStation/SwanStation.opt`. This is a genuine, separate on/off switch
+  per core for whether it emulates controller rumble at all, independent of everything else
+  being correctly wired up. Different cores will have their own equivalent option under
+  their own `.opt` file if a game doesn't rumble even though another game/core does.
+
 ## Requirements
 
 - An Android TV device with a USB-A port (built and tested on an NVIDIA Shield TV Pro,
