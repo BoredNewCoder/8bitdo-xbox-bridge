@@ -112,17 +112,20 @@ class GipBridgeService : Service() {
         override fun onRumble(strongPercent: Int, weakPercent: Int, durationMs: Int) {
             pendingRumbleStop?.let { mainHandler.removeCallbacks(it) }
             pendingRumbleStop = null
-            // Main motors only. Linux's standard FF_RUMBLE effect (what RetroArch/games
-            // actually send) only has 2 channels — strong/weak — with no way to address the
-            // trigger motors separately, so a real game rumble should never touch them. The
-            // trigger motors are only reachable via the manual Test Rumble button, which
-            // exercises them deliberately with GipMotor.ALL.
-            sendRumble(strongPercent, weakPercent, if (durationMs > 0) durationMs else 200, GipMotor.LEFT or GipMotor.RIGHT)
+            // Weak (small/high-freq) motor only. Real game rumble stays off the trigger
+            // motors — Linux's standard FF_RUMBLE effect (what RetroArch/games actually send)
+            // only has 2 channels with no way to address triggers separately anyway. Also off
+            // the strong (large/low-freq) motor by request: confirmed live in Gran Turismo that
+            // RetroArch 1.22.2 OR-merges strong+weak into one identical value for both
+            // channels (its own dual-motor code path doesn't exist in this version — confirmed
+            // against the real installed build's source), so both motors were firing at equal
+            // magnitude — the weak motor alone reads as noticeably gentler at the same value.
+            sendRumble(strongPercent, weakPercent, if (durationMs > 0) durationMs else 200, GipMotor.RIGHT)
         }
         override fun onRumbleStop() {
             pendingRumbleStop?.let { mainHandler.removeCallbacks(it) }
             val stop = Runnable {
-                sendRumble(0, 0, 0, GipMotor.LEFT or GipMotor.RIGHT)
+                sendRumble(0, 0, 0, GipMotor.RIGHT)
                 pendingRumbleStop = null
             }
             pendingRumbleStop = stop
