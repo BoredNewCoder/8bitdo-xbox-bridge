@@ -92,9 +92,13 @@ class GipBridgeService : Service() {
         }.onFailure { log("Settings launch failed: ${it.message}") }
     }
 
+    // Bump this on every release that touches GamepadInjectorService/uinput_gamepad.c --
+    // Shizuku reuses a cached injector process across app updates when this doesn't change,
+    // which silently kept old native code running through several rebuilds during
+    // development (real bug hunted down live, cost real debugging time more than once).
     private val userServiceArgs = Shizuku.UserServiceArgs(
         ComponentName(BuildConfig.APPLICATION_ID, GamepadInjectorService::class.java.name)
-    ).daemon(false).processNameSuffix("injector").debuggable(false).version(1)
+    ).daemon(false).processNameSuffix("injector").debuggable(false).version(2)
 
     // Runs on a binder thread from the Shizuku process's FF poll loop. durationMs is currently
     // always 0 from GamepadInjectorService (ff_replay.length parsing deferred) — treated as
@@ -254,6 +258,35 @@ class GipBridgeService : Service() {
         }
     }
 
+    private fun registerTestReceivers() {
+        val testRumbleFilter = IntentFilter(ACTION_TEST_RUMBLE)
+        val testSelectHoldFilter = IntentFilter(ACTION_TEST_SELECT_HOLD)
+        val testNavFilter = IntentFilter(ACTION_TEST_NAV)
+        val testEnableRumbleFilter = IntentFilter("com.vanzetta.gipbridge.TEST_ENABLE_RUMBLE")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(testRumbleReceiver, testRumbleFilter, Context.RECEIVER_NOT_EXPORTED)
+            registerReceiver(testSelectHoldReceiver, testSelectHoldFilter, Context.RECEIVER_NOT_EXPORTED)
+            registerReceiver(testNavReceiver, testNavFilter, Context.RECEIVER_NOT_EXPORTED)
+            registerReceiver(testEnableRumbleReceiver, testEnableRumbleFilter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(testRumbleReceiver, testRumbleFilter)
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(testSelectHoldReceiver, testSelectHoldFilter)
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(testNavReceiver, testNavFilter)
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(testEnableRumbleReceiver, testEnableRumbleFilter)
+        }
+    }
+
+    private fun unregisterTestReceivers() {
+        runCatching { unregisterReceiver(testRumbleReceiver) }
+        runCatching { unregisterReceiver(testSelectHoldReceiver) }
+        runCatching { unregisterReceiver(testNavReceiver) }
+        runCatching { unregisterReceiver(testEnableRumbleReceiver) }
+    }
+
     private val usbAttachReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             val device: UsbDevice? = intent.getParcelableExtraCompat(UsbManager.EXTRA_DEVICE)
@@ -290,18 +323,10 @@ class GipBridgeService : Service() {
         val permFilter = IntentFilter(ACTION_USB_PERMISSION)
         val attachFilter = IntentFilter(UsbManager.ACTION_USB_DEVICE_ATTACHED)
         val detachFilter = IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED)
-        val testRumbleFilter = IntentFilter(ACTION_TEST_RUMBLE)
-        val testSelectHoldFilter = IntentFilter(ACTION_TEST_SELECT_HOLD)
-        val testNavFilter = IntentFilter(ACTION_TEST_NAV)
-        val testEnableRumbleFilter = IntentFilter("com.vanzetta.gipbridge.TEST_ENABLE_RUMBLE")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(usbPermissionReceiver, permFilter, Context.RECEIVER_NOT_EXPORTED)
             registerReceiver(usbAttachReceiver, attachFilter, Context.RECEIVER_NOT_EXPORTED)
             registerReceiver(usbDetachReceiver, detachFilter, Context.RECEIVER_NOT_EXPORTED)
-            registerReceiver(testRumbleReceiver, testRumbleFilter, Context.RECEIVER_NOT_EXPORTED)
-            registerReceiver(testSelectHoldReceiver, testSelectHoldFilter, Context.RECEIVER_NOT_EXPORTED)
-            registerReceiver(testNavReceiver, testNavFilter, Context.RECEIVER_NOT_EXPORTED)
-            registerReceiver(testEnableRumbleReceiver, testEnableRumbleFilter, Context.RECEIVER_NOT_EXPORTED)
         } else {
             @Suppress("UnspecifiedRegisterReceiverFlag")
             registerReceiver(usbPermissionReceiver, permFilter)
@@ -309,15 +334,11 @@ class GipBridgeService : Service() {
             registerReceiver(usbAttachReceiver, attachFilter)
             @Suppress("UnspecifiedRegisterReceiverFlag")
             registerReceiver(usbDetachReceiver, detachFilter)
-            @Suppress("UnspecifiedRegisterReceiverFlag")
-            registerReceiver(testRumbleReceiver, testRumbleFilter)
-            @Suppress("UnspecifiedRegisterReceiverFlag")
-            registerReceiver(testSelectHoldReceiver, testSelectHoldFilter)
-            @Suppress("UnspecifiedRegisterReceiverFlag")
-            registerReceiver(testNavReceiver, testNavFilter)
-            @Suppress("UnspecifiedRegisterReceiverFlag")
-            registerReceiver(testEnableRumbleReceiver, testEnableRumbleFilter)
         }
+        // Debug-only remote test/diagnostic hooks (Test Rumble, SELECT-hold, nav, force-enable
+        // rumble) — real dev tooling built during bring-up, not part of the shipped feature
+        // set. Gated out of release builds entirely rather than just left in unused.
+        if (BuildConfig.DEBUG) registerTestReceivers()
 
         Shizuku.addRequestPermissionResultListener(shizukuPermissionListener)
         Shizuku.addBinderReceivedListenerSticky { setupShizuku() }
@@ -607,6 +628,8 @@ class GipBridgeService : Service() {
 
     // strongPercent/weakPercent are 0-100, scaled down further by the user's configured
     // rumble strength. durationMs=0 sends an explicit stop (all motors off).
+    private var lastLoggedRumbleState: Triple<Int, Int, Int>? = null
+
     private fun sendRumble(strongPercent: Int, weakPercent: Int, durationMs: Int, motors: Int = GipMotor.ALL) {
         val conn = gipConnection ?: run { log("sendRumble: no gipConnection, skipping"); return }
         val epOut = gipEpOut ?: run { log("sendRumble: no gipEpOut, skipping"); return }
@@ -618,7 +641,14 @@ class GipBridgeService : Service() {
         val durationTens = (durationMs / 10).coerceIn(0, 255)
 
         val payload = buildRumblePayload(motors = motors, leftTrigger = left, rightTrigger = right, left = left, right = right, durationTens = durationTens)
-        log("sendRumble: motors=0x${motors.toString(16)} left=$left right=$right durationTens=$durationTens payload=${payload.toHex()}")
+        // Log only on real state change, not every packet — a sustained rumble effect (e.g.
+        // GT's continuous throttle buzz) resends the same magnitude ~15x/sec, and logging
+        // every single one buries real signal in noise for no benefit once the state is known.
+        val state = Triple(motors, left, right)
+        if (state != lastLoggedRumbleState) {
+            log("sendRumble: motors=0x${motors.toString(16)} left=$left right=$right durationTens=$durationTens payload=${payload.toHex()}")
+            lastLoggedRumbleState = state
+        }
         val hdr = GipHeader(
             command = GipCommand.RUMBLE,
             options = 0, // per xone's gip_send_rumble: clientId only, no INTERNAL flag
@@ -835,10 +865,7 @@ class GipBridgeService : Service() {
         runCatching { unregisterReceiver(usbPermissionReceiver) }
         runCatching { unregisterReceiver(usbAttachReceiver) }
         runCatching { unregisterReceiver(usbDetachReceiver) }
-        runCatching { unregisterReceiver(testRumbleReceiver) }
-        runCatching { unregisterReceiver(testSelectHoldReceiver) }
-        runCatching { unregisterReceiver(testNavReceiver) }
-        runCatching { unregisterReceiver(testEnableRumbleReceiver) }
+        if (BuildConfig.DEBUG) unregisterTestReceivers()
         runCatching { injector?.stopRumble() }
         runCatching { Shizuku.unbindUserService(userServiceArgs, userServiceConnection, true) }
         runCatching { Shizuku.removeRequestPermissionResultListener(shizukuPermissionListener) }
