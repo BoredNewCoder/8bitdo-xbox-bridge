@@ -100,10 +100,15 @@ class GipBridgeService : Service() {
     // one-shot with an explicit duration, not a persistent on/off state like Linux FF play/stop.
     private val rumbleCallback = object : IRumbleCallback.Stub() {
         override fun onRumble(strongPercent: Int, weakPercent: Int, durationMs: Int) {
-            sendRumble(strongPercent, weakPercent, if (durationMs > 0) durationMs else 200)
+            // Main motors only. Linux's standard FF_RUMBLE effect (what RetroArch/games
+            // actually send) only has 2 channels — strong/weak — with no way to address the
+            // trigger motors separately, so a real game rumble should never touch them. The
+            // trigger motors are only reachable via the manual Test Rumble button, which
+            // exercises them deliberately with GipMotor.ALL.
+            sendRumble(strongPercent, weakPercent, if (durationMs > 0) durationMs else 200, GipMotor.LEFT or GipMotor.RIGHT)
         }
         override fun onRumbleStop() {
-            sendRumble(0, 0, 0)
+            sendRumble(0, 0, 0, GipMotor.LEFT or GipMotor.RIGHT)
         }
     }
 
