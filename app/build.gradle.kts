@@ -11,8 +11,8 @@ android {
         applicationId = "com.vanzetta.gipbridge"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1"
+        versionCode = 6
+        versionName = "0.6"
         ndk {
             // Shield TV Pro is arm64 — no need to ship other ABIs.
             abiFilters += "arm64-v8a"
