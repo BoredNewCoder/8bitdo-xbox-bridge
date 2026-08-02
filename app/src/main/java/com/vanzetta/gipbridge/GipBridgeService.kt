@@ -473,7 +473,7 @@ class GipBridgeService : Service() {
             state.stickLeftX / 32767f,
             -state.stickLeftY / 32767f, // confirmed live: inverted (down read as up) via the real uinput device — old injectInputEvent path didn't have this issue
             state.stickRightX / 32767f,
-            state.stickRightY / 32767f,
+            -state.stickRightY / 32767f, // same signed-range calibration path as left stick Y — untested, predicted to need the same fix, please confirm
             state.triggerLeft / 1023f,
             state.triggerRight / 1023f,
             hatX,
