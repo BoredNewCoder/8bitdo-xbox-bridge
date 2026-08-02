@@ -40,6 +40,8 @@ typedef struct {
     int in_use;
     unsigned short strong;
     unsigned short weak;
+    unsigned short duration_ms; // ff_effect.replay.length — 0 in the real protocol means
+                                 // "play until explicitly stopped", not "no duration"
 } ff_slot_t;
 
 static ff_slot_t g_effects[MAX_FF_EFFECTS];
@@ -184,6 +186,7 @@ Java_com_vanzetta_gipbridge_GamepadInjectorService_nativePollFF(JNIEnv *env, job
             g_effects[id].in_use = 1;
             g_effects[id].strong = upload.effect.u.rumble.strong_magnitude;
             g_effects[id].weak = upload.effect.u.rumble.weak_magnitude;
+            g_effects[id].duration_ms = upload.effect.replay.length;
         }
 
         upload.retval = 0;
@@ -206,10 +209,13 @@ Java_com_vanzetta_gipbridge_GamepadInjectorService_nativePollFF(JNIEnv *env, job
     if (ev.type == EV_FF) {
         int id = ev.code;
         if (id < 0 || id >= MAX_FF_EFFECTS || !g_effects[id].in_use) return 0;
+        // type is 1 (play) or 2 (stop) — never 0 — so a real event can never collide with the
+        // "nothing happened" 0 sentinel this function returns elsewhere.
         long long type = ev.value != 0 ? 1 : 2;
         long long strong = g_effects[id].strong;
         long long weak = g_effects[id].weak;
-        return (type << 48) | (((long long) id) << 32) | (strong << 16) | weak;
+        long long duration = g_effects[id].duration_ms;
+        return (type << 60) | (strong << 38) | (weak << 22) | (duration << 6);
     }
 
     return 0;

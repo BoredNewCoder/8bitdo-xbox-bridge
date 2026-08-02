@@ -151,15 +151,20 @@ class GamepadInjectorService : IGamepadInjector.Stub() {
             while (rumblePolling) {
                 val packed = nativePollFF(uinputFd)
                 if (packed < 0) { Thread.sleep(50); continue }
-                val type = (packed ushr 48) and 0xFFFF
+                val type = (packed ushr 60) and 0x3L
                 if (type == 0L) continue
-                val strong = (packed ushr 16) and 0xFFFF
-                val weak = packed and 0xFFFF
+                val strong = (packed ushr 38) and 0xFFFFL
+                val weak = (packed ushr 22) and 0xFFFFL
+                val durationMs = (packed ushr 6) and 0xFFFFL
                 runCatching {
                     if (type == 1L) {
                         val strongPct = (strong * 100 / 65535).toInt()
                         val weakPct = (weak * 100 / 65535).toInt()
-                        callback.onRumble(strongPct, weakPct, 0)
+                        // ff_replay.length==0 means "play until stopped" in the real Linux FF
+                        // protocol — most game rumble effects don't rely on that and set a real
+                        // length, but fall back to a short pulse instead of literally forever
+                        // for the ones that do (an infinite rumble would be a real bug to ship).
+                        callback.onRumble(strongPct, weakPct, if (durationMs > 0) durationMs.toInt() else 200)
                     } else {
                         callback.onRumbleStop()
                     }
