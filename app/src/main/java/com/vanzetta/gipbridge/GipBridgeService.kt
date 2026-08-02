@@ -39,11 +39,6 @@ private const val SHIZUKU_PERMISSION_REQUEST_CODE = 4242
 private const val XBOX_LONG_PRESS_MS = 500L
 private const val NOTIF_CHANNEL_ID = "gip_bridge_service"
 private const val NOTIF_ID = 1
-// Confirmed live: Gran Turismo sends continuous ~75% rumble tied to RPM while on the
-// throttle, not just on impacts — real behavior on real hardware, but by request only strong
-// impacts (crashes, near-max magnitude) should reach the controller, not the constant ambient
-// engine buzz. Below this, treated as no rumble at all.
-private const val RUMBLE_IMPACT_THRESHOLD = 85
 
 /**
  * Owns the USB session, Shizuku injector binding, and G733 lights control as a foreground
@@ -113,10 +108,8 @@ class GipBridgeService : Service() {
     // smooth continuous rumble. Debouncing the stop: delay it briefly and cancel if a new
     // onRumble() arrives first, so back-to-back refreshes never actually zero the motor.
     private var pendingRumbleStop: Runnable? = null
-
     private val rumbleCallback = object : IRumbleCallback.Stub() {
         override fun onRumble(strongPercent: Int, weakPercent: Int, durationMs: Int) {
-            if (maxOf(strongPercent, weakPercent) < RUMBLE_IMPACT_THRESHOLD) return
             pendingRumbleStop?.let { mainHandler.removeCallbacks(it) }
             pendingRumbleStop = null
             // Weak (small/high-freq) motor only. Real game rumble stays off the trigger
