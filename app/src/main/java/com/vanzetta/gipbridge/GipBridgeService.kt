@@ -100,8 +100,18 @@ class GipBridgeService : Service() {
     // always 0 from GamepadInjectorService (ff_replay.length parsing deferred) — treated as
     // "play until stop", matched with a short repeat/rearm window since GIP rumble packets are
     // one-shot with an explicit duration, not a persistent on/off state like Linux FF play/stop.
+    // Confirmed live in Gran Turismo: the core re-uploads/re-plays the rumble effect on a
+    // timer (~65ms interval) instead of one long-running effect — normal for a "continuous
+    // while accelerating" engine sound tied to RPM. Each play already carries its own hardware
+    // duration, so sending an explicit motor-stop between every refresh hard-cuts the motor
+    // and immediately restarts it, which feels like stuttering/"rumbling like crazy" instead of
+    // smooth continuous rumble. Debouncing the stop: delay it briefly and cancel if a new
+    // onRumble() arrives first, so back-to-back refreshes never actually zero the motor.
+    private var pendingRumbleStop: Runnable? = null
     private val rumbleCallback = object : IRumbleCallback.Stub() {
         override fun onRumble(strongPercent: Int, weakPercent: Int, durationMs: Int) {
+            pendingRumbleStop?.let { mainHandler.removeCallbacks(it) }
+            pendingRumbleStop = null
             // Main motors only. Linux's standard FF_RUMBLE effect (what RetroArch/games
             // actually send) only has 2 channels — strong/weak — with no way to address the
             // trigger motors separately, so a real game rumble should never touch them. The
@@ -110,7 +120,13 @@ class GipBridgeService : Service() {
             sendRumble(strongPercent, weakPercent, if (durationMs > 0) durationMs else 200, GipMotor.LEFT or GipMotor.RIGHT)
         }
         override fun onRumbleStop() {
-            sendRumble(0, 0, 0, GipMotor.LEFT or GipMotor.RIGHT)
+            pendingRumbleStop?.let { mainHandler.removeCallbacks(it) }
+            val stop = Runnable {
+                sendRumble(0, 0, 0, GipMotor.LEFT or GipMotor.RIGHT)
+                pendingRumbleStop = null
+            }
+            pendingRumbleStop = stop
+            mainHandler.postDelayed(stop, 150)
         }
     }
 
