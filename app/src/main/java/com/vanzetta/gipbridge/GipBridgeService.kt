@@ -23,6 +23,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.KeyEvent
 import android.widget.Toast
@@ -37,6 +38,7 @@ private const val ACTION_TEST_SELECT_HOLD = "com.vanzetta.gipbridge.TEST_SELECT_
 private const val ACTION_TEST_NAV = "com.vanzetta.gipbridge.TEST_NAV"
 private const val SHIZUKU_PERMISSION_REQUEST_CODE = 4242
 private const val XBOX_LONG_PRESS_MS = 500L
+private const val INPUT_LOG_THROTTLE_MS = 200L
 private const val NOTIF_CHANNEL_ID = "gip_bridge_service"
 private const val NOTIF_ID = 1
 
@@ -74,6 +76,10 @@ class GipBridgeService : Service() {
 
     @Volatile private var injector: IGamepadInjector? = null
     private var lastButtons = 0
+    // Analog axes wobble every poll during active stick movement, so equality-based dedup
+    // (like sendRumble's) never suppresses anything here — throttle by time instead. Unthrottled
+    // this was Log.d + StringBuilder append at ~250Hz while a stick was held off-center.
+    private var lastInputLogAtMs = 0L
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var xboxLongPressFired = false
@@ -529,7 +535,11 @@ class GipBridgeService : Service() {
                     if (state != null && (state.buttons != 0 || state.triggerLeft != 0 || state.triggerRight != 0 ||
                             kotlin.math.abs(state.stickLeftX) > 3000 || kotlin.math.abs(state.stickLeftY) > 3000 ||
                             kotlin.math.abs(state.stickRightX) > 3000 || kotlin.math.abs(state.stickRightY) > 3000)) {
-                        log("INPUT: ${state.describe()}")
+                        val now = SystemClock.elapsedRealtime()
+                        if (now - lastInputLogAtMs >= INPUT_LOG_THROTTLE_MS) {
+                            log("INPUT: ${state.describe()}")
+                            lastInputLogAtMs = now
+                        }
                     } else if (inputPacketsSeen <= 2) {
                         log("INPUT #$inputPacketsSeen idle (${payload.size}B)")
                     }
