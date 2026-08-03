@@ -159,17 +159,27 @@ class GipBridgeService : Service() {
     private val shizukuPermissionListener = Shizuku.OnRequestPermissionResultListener { _, grantResult ->
         if (grantResult == PackageManager.PERMISSION_GRANTED) {
             log("Shizuku permission granted, binding injector service...")
-            Shizuku.bindUserService(userServiceArgs, userServiceConnection)
+            bindInjector()
         } else {
             log("Shizuku permission DENIED — system-wide injection unavailable.")
         }
     }
 
+    // Force-unbind (destroy=true) before every bind — covers the binder-died-but-app-alive
+    // case (same userServiceConnection still holds a live binding to destroy). Does NOT cover
+    // orphans left by a full app process restart (force-stop, OOM kill): a fresh process has
+    // nothing to unbind, so this is a no-op there — confirmed live, still leaves stale
+    // :injector processes running. That case is handled by killStaleSiblings() in
+    // GamepadInjectorService instead, which runs as the same shell UID as the orphans.
+    private fun bindInjector() {
+        runCatching { Shizuku.unbindUserService(userServiceArgs, userServiceConnection, true) }
+        Shizuku.bindUserService(userServiceArgs, userServiceConnection)
+    }
+
     private fun setupShizuku() {
         if (Shizuku.isPreV11()) { log("Shizuku pre-v11, unsupported."); return }
         when {
-            Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED ->
-                Shizuku.bindUserService(userServiceArgs, userServiceConnection)
+            Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED -> bindInjector()
             Shizuku.shouldShowRequestPermissionRationale() ->
                 log("Shizuku permission previously denied by user.")
             else -> Shizuku.requestPermission(SHIZUKU_PERMISSION_REQUEST_CODE)

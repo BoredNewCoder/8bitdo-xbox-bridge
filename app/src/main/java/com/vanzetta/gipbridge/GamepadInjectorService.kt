@@ -82,7 +82,27 @@ class GamepadInjectorService : IGamepadInjector.Stub() {
 
     private var uinputFd: Int = -1
 
+    // Shizuku ties this process's lifecycle to a clean unbind from the host app; an abnormal
+    // host exit (force-stop, OOM kill on the TV box) skips that, orphaning this process forever
+    // — Shizuku spawns a fresh one on the next bind rather than reusing or reaping the old one
+    // (confirmed live: 3 stale :injector processes accumulated this way and killed rumble by
+    // leaving it ambiguous which process's uinput device a game's FF events would reach).
+    // This process already runs as shell UID (same as the orphans), so it can kill same-UID
+    // siblings directly — same ProcessBuilder shell-out pattern as openSettings() below.
+    private fun killStaleSiblings() {
+        val myPid = android.os.Process.myPid()
+        runCatching {
+            val proc = ProcessBuilder(
+                "sh", "-c",
+                "for p in \$(pidof com.vanzetta.gipbridge:injector); do " +
+                    "[ \"\$p\" != \"$myPid\" ] && kill -9 \"\$p\"; done",
+            ).redirectErrorStream(true).start()
+            proc.waitFor()
+        }.onFailure { Log.e(TAG, "killStaleSiblings failed: ${it.message}") }
+    }
+
     init {
+        killStaleSiblings()
         uinputFd = runCatching { nativeOpenUinput("GIP Bridge Virtual Gamepad") }.getOrElse { -1 }
         Log.d(TAG, "uinput gamepad fd=$uinputFd")
     }
