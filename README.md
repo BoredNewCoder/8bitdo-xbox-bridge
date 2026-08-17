@@ -56,6 +56,9 @@ that same wire protocol as an Android USB Host API client, then uses
   deadzone-based dedup on the outgoing side — a stalled Shizuku IPC call can't delay the
   next controller read, and idle input (controller sitting untouched) doesn't spam
   cross-process calls at the controller's native poll rate
+- USB reads (controller and G733) are wrapped so a single bad transfer can't crash the
+  app (Android's default exception handling is process-wide, not per-thread — a naive
+  reader loop can take the whole app down over one bad transfer)
 
 ## What doesn't work
 
