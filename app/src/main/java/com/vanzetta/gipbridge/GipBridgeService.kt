@@ -499,11 +499,18 @@ class GipBridgeService : Service() {
         }
     }
 
+    // Real crash-safety fix, same class of bug found+fixed in the sibling ds3-charger-app
+    // this session: bulkTransfer() (and everything else in this loop body) ran with no
+    // try/catch. Android's default UncaughtExceptionHandler is process-wide, not per-thread —
+    // an uncaught exception on ANY thread (this reader thread included) kills the WHOLE app,
+    // not just this loop. Wrapping the whole iteration means one bad transfer/packet just
+    // gets logged and retried on the next iteration, not fatal.
     private fun readLoop(conn: UsbDeviceConnection, epIn: UsbEndpoint, epOut: UsbEndpoint) {
         val buf = ByteArray(256)
         var packetsSeen = 0
         var inputPacketsSeen = 0
         while (running) {
+          try {
             val n = conn.bulkTransfer(epIn, buf, buf.size, 2000)
             // n<=0 also happens on a genuine detach (immediate failure, not a timeout) —
             // a short sleep here guarantees this never busy-spins regardless of which.
@@ -581,6 +588,10 @@ class GipBridgeService : Service() {
                     log("unhandled cmd=0x${hdr.command.toString(16)} opts=0x${hdr.options.toString(16)} raw=${payload.toHex()}")
                 }
             }
+          } catch (e: Throwable) {
+            log("readLoop iteration failed: ${e.message}")
+            Thread.sleep(50)
+          }
         }
         log("Read loop stopped after $packetsSeen packets ($inputPacketsSeen INPUT).")
     }
@@ -789,15 +800,21 @@ class GipBridgeService : Service() {
         g733BatteryToast?.cancel()
     }
 
+    // Same crash-safety fix as readLoop() above — see its comment.
     private fun g733ReadLoop(conn: UsbDeviceConnection, epIn: UsbEndpoint) {
         val buf = ByteArray(64)
         while (g733Running) {
-            val n = conn.bulkTransfer(epIn, buf, buf.size, 2000)
-            // n<=0 also happens on a genuine detach (immediate failure, not a timeout) —
-            // a short sleep here guarantees this never busy-spins regardless of which.
-            if (n <= 0) { Thread.sleep(50); continue }
-            val data = buf.copyOf(n)
-            parseG733Report(data)
+            try {
+                val n = conn.bulkTransfer(epIn, buf, buf.size, 2000)
+                // n<=0 also happens on a genuine detach (immediate failure, not a timeout) —
+                // a short sleep here guarantees this never busy-spins regardless of which.
+                if (n <= 0) { Thread.sleep(50); continue }
+                val data = buf.copyOf(n)
+                parseG733Report(data)
+            } catch (e: Throwable) {
+                log("g733ReadLoop iteration failed: ${e.message}")
+                Thread.sleep(50)
+            }
         }
         log("G733 read loop stopped.")
     }
