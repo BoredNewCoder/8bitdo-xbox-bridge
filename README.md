@@ -48,6 +48,14 @@ that same wire protocol as an Android USB Host API client, then uses
 - G733 battery percentage: toggling the headset's power switch shows a toast with current
   battery % (and charging state) — same wire protocol as G HUB's own display, triggered
   off a link-event report captured live rather than continuous polling
+- Device shows up correctly as **"8BitDo GIP Bridge Gamepad"** in RetroArch's controller
+  list — an earlier name containing the word "Virtual" got silently relabeled as "SHIELD
+  Virtual Controller" by RetroArch's Android input driver, which hardcodes that substring
+  as a special case for the Shield remote's own system virtual device
+- Analog sticks/triggers and USB reads are decoupled onto separate threads with
+  deadzone-based dedup on the outgoing side — a stalled Shizuku IPC call can't delay the
+  next controller read, and idle input (controller sitting untouched) doesn't spam
+  cross-process calls at the controller's native poll rate
 
 ## What doesn't work
 
