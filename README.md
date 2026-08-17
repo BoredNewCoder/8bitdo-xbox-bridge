@@ -65,6 +65,16 @@ that same wire protocol as an Android USB Host API client, then uses
   prompts from the same process, not something fixable cleanly from app code. Workaround:
   force-stop the app and reopen it (Android TV Settings → Apps → GIP Bridge → Force stop).
   A first-time attach in a fresh app launch always works.
+- The G733's **volume wheel doesn't reach some apps** (confirmed with Plex and Pluto TV) —
+  it works fine at the system level and in most apps, but these two specifically don't
+  react to it. Likely cause: this app exclusively claims the G733's status/battery HID
+  interface (`claimInterface(hidIface, true)`), which is the same interface the wheel's
+  reports travel through — some apps may read raw volume-key input differently than the
+  system's own audio stack does, and lose out to the exclusive claim. Not fixed — the
+  system-level fix (giving up the exclusive claim) risks breaking the battery/lights
+  features that are the actual point of this app, so this is being left as a known gap
+  rather than traded off. Workaround: use the app's own on-screen volume control, or the
+  remote's physical volume buttons, in those specific apps.
 
 ## Rumble/input architecture
 
