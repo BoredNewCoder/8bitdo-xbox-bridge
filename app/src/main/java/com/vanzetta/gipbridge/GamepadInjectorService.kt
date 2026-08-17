@@ -103,7 +103,12 @@ class GamepadInjectorService : IGamepadInjector.Stub() {
 
     init {
         killStaleSiblings()
-        uinputFd = runCatching { nativeOpenUinput("GIP Bridge Virtual Gamepad") }.getOrElse { -1 }
+        // Name must NOT contain the substring "Virtual" -- RetroArch's Android input driver
+        // (input/drivers/android_input.c) hardcodes a special case that relabels any device
+        // whose name contains "Virtual" as "SHIELD Virtual Controller" (meant for the Shield
+        // remote's NVIDIA-button/CEC virtual device), which swallowed this controller's real
+        // identity and made it indistinguishable from that unrelated system device.
+        uinputFd = runCatching { nativeOpenUinput("8BitDo GIP Bridge Gamepad") }.getOrElse { -1 }
         Log.d(TAG, "uinput gamepad fd=$uinputFd")
     }
 
