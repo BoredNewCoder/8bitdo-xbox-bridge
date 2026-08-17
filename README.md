@@ -238,3 +238,10 @@ Standard Android Gradle project. `./gradlew assembleDebug`, output lands in
 
 MIT for the code in this repo. The GIP protocol implementation was written from scratch
 based on reading `xone`'s source, not copied from it — no GPL code is included here.
+
+
+## Support
+
+If this saved you time or you just want to say thanks:
+
+**Cash App:** [$CVanZetta](https://cash.app/$CVanZetta)
