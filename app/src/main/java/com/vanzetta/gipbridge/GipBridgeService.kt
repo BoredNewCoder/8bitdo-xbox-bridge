@@ -63,9 +63,15 @@ class GipBridgeService : Service() {
 
     private lateinit var usbManager: UsbManager
     private var readerThread: Thread? = null
+    private var gipInjectorThread: Thread? = null
     @Volatile private var running = false
     private var gipConnection: UsbDeviceConnection? = null
     private var gipEpOut: UsbEndpoint? = null
+    // Single-slot mailbox, same decoupling fix applied to the sibling raphnet-gc-n64-bridge
+    // project: injectGamepadState()'s Shizuku Binder calls used to run inline on the USB
+    // reader thread, so a stalled IPC call could delay the next bulkTransfer read. Capacity 1
+    // + poll-before-offer keeps only the latest pending state.
+    private val gamepadQueue = java.util.concurrent.ArrayBlockingQueue<GamepadState>(1)
 
     // Read fresh each call (not cached) so a config change via SettingsActivity takes
     // effect on the next USB attach event without needing a service restart.
@@ -469,15 +475,28 @@ class GipBridgeService : Service() {
         gipEpOut = epOut
         running = true
         readerThread = thread(name = "gip-reader") { readLoop(connection, epIn, epOut) }
+        gipInjectorThread = thread(name = "gip-injector") { gipInjectLoop() }
     }
 
     private fun stopGipSession() {
         running = false
         readerThread?.join(500)
+        gipInjectorThread?.join(500)
         runCatching { gipConnection?.close() }
         gipConnection = null
         gipEpOut = null
         readerThread = null
+        gipInjectorThread = null
+    }
+
+    private fun gipInjectLoop() {
+        while (running) {
+            val state = runCatching {
+                gamepadQueue.poll(200, java.util.concurrent.TimeUnit.MILLISECONDS)
+            }.getOrNull() ?: continue
+            runCatching { injectGamepadState(state) }
+                .onFailure { log("inject failed: ${it.message}") }
+        }
     }
 
     private fun readLoop(conn: UsbDeviceConnection, epIn: UsbEndpoint, epOut: UsbEndpoint) {
@@ -554,8 +573,8 @@ class GipBridgeService : Service() {
                         log("INPUT #$inputPacketsSeen idle (${payload.size}B)")
                     }
                     if (state != null) {
-                        runCatching { injectGamepadState(state) }
-                            .onFailure { log("inject failed: ${it.message}") }
+                        gamepadQueue.poll() // drop any stale unconsumed state, keep only latest
+                        gamepadQueue.offer(state)
                     }
                 }
                 else -> {
@@ -565,6 +584,21 @@ class GipBridgeService : Service() {
         }
         log("Read loop stopped after $packetsSeen packets ($inputPacketsSeen INPUT).")
     }
+
+    // Real idle-CPU/IPC fix (same class of bug already found+fixed in the sibling
+    // raphnet-gc-n64-bridge project): buttons were already deduped via XOR, but the sticks
+    // and triggers were sent through Shizuku's cross-process injectAxes() call on EVERY
+    // single INPUT packet unconditionally — including while the controller sits idle on the
+    // table, since the controller keeps polling/reporting at its own native rate regardless
+    // of activity. Deadzone thresholds are raw pre-normalization units (sticks: ~1% of the
+    // full -32767..32767 range; triggers: ~1.5% of 0..1023), sized to absorb ADC noise
+    // without masking a real small stick movement.
+    private var lastSentLX = 0; private var lastSentLY = 0
+    private var lastSentRX = 0; private var lastSentRY = 0
+    private var lastSentLT = 0; private var lastSentRT = 0
+    private var lastSentHatX = 0f; private var lastSentHatY = 0f
+    private val STICK_DEADZONE = 300
+    private val TRIGGER_DEADZONE = 15
 
     private fun injectGamepadState(state: GamepadState) {
         val inj = injector ?: return
@@ -597,16 +631,29 @@ class GipBridgeService : Service() {
             state.buttons and GipButton.DPAD_DOWN != 0 -> 1f
             else -> 0f
         }
-        inj.injectAxes(
-            state.stickLeftX / 32767f,
-            -state.stickLeftY / 32767f, // confirmed live: inverted (down read as up) via the real uinput device — old injectInputEvent path didn't have this issue
-            state.stickRightX / 32767f,
-            -state.stickRightY / 32767f, // same signed-range calibration path as left stick Y — untested, predicted to need the same fix, please confirm
-            state.triggerLeft / 1023f,
-            state.triggerRight / 1023f,
-            hatX,
-            hatY,
-        )
+
+        fun moved(a: Int, b: Int, deadzone: Int) = kotlin.math.abs(a - b) > deadzone
+        val axesChanged = hatX != lastSentHatX || hatY != lastSentHatY ||
+            moved(state.stickLeftX, lastSentLX, STICK_DEADZONE) || moved(state.stickLeftY, lastSentLY, STICK_DEADZONE) ||
+            moved(state.stickRightX, lastSentRX, STICK_DEADZONE) || moved(state.stickRightY, lastSentRY, STICK_DEADZONE) ||
+            moved(state.triggerLeft, lastSentLT, TRIGGER_DEADZONE) || moved(state.triggerRight, lastSentRT, TRIGGER_DEADZONE)
+
+        if (axesChanged) {
+            inj.injectAxes(
+                state.stickLeftX / 32767f,
+                -state.stickLeftY / 32767f, // confirmed live: inverted (down read as up) via the real uinput device — old injectInputEvent path didn't have this issue
+                state.stickRightX / 32767f,
+                -state.stickRightY / 32767f, // same signed-range calibration path as left stick Y — untested, predicted to need the same fix, please confirm
+                state.triggerLeft / 1023f,
+                state.triggerRight / 1023f,
+                hatX,
+                hatY,
+            )
+            lastSentLX = state.stickLeftX; lastSentLY = state.stickLeftY
+            lastSentRX = state.stickRightX; lastSentRY = state.stickRightY
+            lastSentLT = state.triggerLeft; lastSentRT = state.triggerRight
+            lastSentHatX = hatX; lastSentHatY = hatY
+        }
     }
 
     private var seq = 0
