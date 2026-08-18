@@ -67,15 +67,27 @@ class SettingsActivity : Activity() {
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             })
             val controllerBtn = Button(this).apply {
-                text = "Set as Controller"
+                text = "Set as Controller 1"
                 isFocusableInTouchMode = true
                 setOnClickListener {
                     DeviceConfig.setController(this@SettingsActivity, device.vendorId, device.productId)
-                    Toast.makeText(this@SettingsActivity, "Controller set to ${device.productName}", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this@SettingsActivity, "Controller 1 set to ${device.productName}", Toast.LENGTH_SHORT).show()
                     render()
                 }
             }
             row.addView(controllerBtn)
+            // 2-player support: a second, independent controller slot — same VID/PID-match
+            // role concept as Controller 1, just feeding player index 1 instead of 0. Both
+            // controllers can be connected and bridged simultaneously once both slots are set.
+            row.addView(Button(this).apply {
+                text = "Set as Controller 2"
+                isFocusableInTouchMode = true
+                setOnClickListener {
+                    DeviceConfig.setController2(this@SettingsActivity, device.vendorId, device.productId)
+                    Toast.makeText(this@SettingsActivity, "Controller 2 set to ${device.productName}", Toast.LENGTH_SHORT).show()
+                    render()
+                }
+            })
             row.addView(Button(this).apply {
                 text = "Set as Headset"
                 isFocusableInTouchMode = true
@@ -151,8 +163,12 @@ class SettingsActivity : Activity() {
     private fun currentConfigView(): TextView = TextView(this).apply {
         textSize = 12f
         setPadding(0, 0, 0, 32)
-        text = "Current controller: vid=${DeviceConfig.controllerVid(this@SettingsActivity)} " +
+        val c2 = if (DeviceConfig.controller2Configured(this@SettingsActivity))
+            "vid=${DeviceConfig.controller2Vid(this@SettingsActivity)} pid=${DeviceConfig.controller2Pid(this@SettingsActivity)}"
+        else "(not set)"
+        text = "Current controller 1: vid=${DeviceConfig.controllerVid(this@SettingsActivity)} " +
             "pid=${DeviceConfig.controllerPid(this@SettingsActivity)}\n" +
+            "Current controller 2: $c2\n" +
             "Current headset: vid=${DeviceConfig.headsetVid(this@SettingsActivity)} " +
             "pid=${DeviceConfig.headsetPid(this@SettingsActivity)}"
     }

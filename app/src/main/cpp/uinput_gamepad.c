@@ -35,6 +35,13 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 #define MAX_FF_EFFECTS 16
+// Real bug fixed for 2-controller support: g_effects used to be one global table shared by
+// every open uinput fd. With a single device this was harmless, but two simultaneously-open
+// devices each get their own kernel-assigned effect ids starting from 0 — device B's effect
+// id=0 would silently stomp device A's g_effects[0], corrupting whichever rumble state was
+// read back. Fixed by keying the table per-device (slot), found via a small fd->slot lookup
+// so the existing fd-based Kotlin/AIDL call signatures don't need to change at all.
+#define MAX_DEVICES 4
 
 typedef struct {
     int in_use;
@@ -44,7 +51,17 @@ typedef struct {
                                  // "play until explicitly stopped", not "no duration"
 } ff_slot_t;
 
-static ff_slot_t g_effects[MAX_FF_EFFECTS];
+static int g_open_fds[MAX_DEVICES] = { -1, -1, -1, -1 };
+static ff_slot_t g_effects[MAX_DEVICES][MAX_FF_EFFECTS];
+
+// Returns the slot index for an already-open fd, or -1 if not found (should not happen for
+// fds this file itself handed out).
+static int find_slot(int fd) {
+    for (int i = 0; i < MAX_DEVICES; i++) {
+        if (g_open_fds[i] == fd) return i;
+    }
+    return -1;
+}
 
 static void write_event(int fd, unsigned short type, unsigned short code, int value) {
     struct input_event ev;
@@ -61,6 +78,16 @@ JNIEXPORT jint JNICALL
 Java_com_vanzetta_gipbridge_GamepadInjectorService_nativeOpenUinput(JNIEnv *env, jobject thiz, jstring jname) {
     (void) thiz;
     const char *name = (*env)->GetStringUTFChars(env, jname, NULL);
+
+    int slot = -1;
+    for (int i = 0; i < MAX_DEVICES; i++) {
+        if (g_open_fds[i] == -1) { slot = i; break; }
+    }
+    if (slot < 0) {
+        LOGE("nativeOpenUinput: no free device slot (MAX_DEVICES=%d)", MAX_DEVICES);
+        (*env)->ReleaseStringUTFChars(env, jname, name);
+        return -1;
+    }
 
     // Deliberately blocking (no O_NONBLOCK): nativePollFF() below relies on read() blocking
     // until the kernel has an FF upload/erase/play event, instead of a busy-poll loop.
@@ -124,8 +151,9 @@ Java_com_vanzetta_gipbridge_GamepadInjectorService_nativeOpenUinput(JNIEnv *env,
     }
 
     (*env)->ReleaseStringUTFChars(env, jname, name);
-    memset(g_effects, 0, sizeof(g_effects));
-    LOGI("uinput gamepad created, fd=%d", fd);
+    g_open_fds[slot] = fd;
+    memset(g_effects[slot], 0, sizeof(g_effects[slot])); // only this device's slot, not every open device's
+    LOGI("uinput gamepad created, fd=%d slot=%d", fd, slot);
     return fd;
 }
 
@@ -135,6 +163,8 @@ Java_com_vanzetta_gipbridge_GamepadInjectorService_nativeCloseUinput(JNIEnv *env
     if (fd >= 0) {
         ioctl(fd, UI_DEV_DESTROY);
         close(fd);
+        int slot = find_slot(fd);
+        if (slot >= 0) g_open_fds[slot] = -1;
     }
 }
 
@@ -175,6 +205,9 @@ Java_com_vanzetta_gipbridge_GamepadInjectorService_nativePollFF(JNIEnv *env, job
         return -1;
     }
 
+    int slot = find_slot(fd);
+    if (slot < 0) return 0; // fd not tracked (closed mid-read?) — nothing safe to index into
+
     if (ev.type == EV_UINPUT && ev.code == UI_FF_UPLOAD) {
         struct uinput_ff_upload upload;
         memset(&upload, 0, sizeof(upload));
@@ -183,10 +216,10 @@ Java_com_vanzetta_gipbridge_GamepadInjectorService_nativePollFF(JNIEnv *env, job
 
         int id = upload.effect.id;
         if (upload.effect.type == FF_RUMBLE && id >= 0 && id < MAX_FF_EFFECTS) {
-            g_effects[id].in_use = 1;
-            g_effects[id].strong = upload.effect.u.rumble.strong_magnitude;
-            g_effects[id].weak = upload.effect.u.rumble.weak_magnitude;
-            g_effects[id].duration_ms = upload.effect.replay.length;
+            g_effects[slot][id].in_use = 1;
+            g_effects[slot][id].strong = upload.effect.u.rumble.strong_magnitude;
+            g_effects[slot][id].weak = upload.effect.u.rumble.weak_magnitude;
+            g_effects[slot][id].duration_ms = upload.effect.replay.length;
         }
 
         upload.retval = 0;
@@ -200,7 +233,7 @@ Java_com_vanzetta_gipbridge_GamepadInjectorService_nativePollFF(JNIEnv *env, job
         erase.request_id = (unsigned int) ev.value;
         ioctl(fd, UI_BEGIN_FF_ERASE, &erase);
         int id = (int) erase.effect_id;
-        if (id >= 0 && id < MAX_FF_EFFECTS) g_effects[id].in_use = 0;
+        if (id >= 0 && id < MAX_FF_EFFECTS) g_effects[slot][id].in_use = 0;
         erase.retval = 0;
         ioctl(fd, UI_END_FF_ERASE, &erase);
         return 0;
@@ -208,13 +241,13 @@ Java_com_vanzetta_gipbridge_GamepadInjectorService_nativePollFF(JNIEnv *env, job
 
     if (ev.type == EV_FF) {
         int id = ev.code;
-        if (id < 0 || id >= MAX_FF_EFFECTS || !g_effects[id].in_use) return 0;
+        if (id < 0 || id >= MAX_FF_EFFECTS || !g_effects[slot][id].in_use) return 0;
         // type is 1 (play) or 2 (stop) — never 0 — so a real event can never collide with the
         // "nothing happened" 0 sentinel this function returns elsewhere.
         long long type = ev.value != 0 ? 1 : 2;
-        long long strong = g_effects[id].strong;
-        long long weak = g_effects[id].weak;
-        long long duration = g_effects[id].duration_ms;
+        long long strong = g_effects[slot][id].strong;
+        long long weak = g_effects[slot][id].weak;
+        long long duration = g_effects[slot][id].duration_ms;
         return (type << 60) | (strong << 38) | (weak << 22) | (duration << 6);
     }
 

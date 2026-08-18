@@ -80,7 +80,12 @@ class GamepadInjectorService : IGamepadInjector.Stub() {
         }
     }
 
-    private var uinputFd: Int = -1
+    // One uinput fd per player slot (index 0 = player 1, 1 = player 2) instead of a single
+    // fd — added for 2-controller support. GipBridgeService now opens each slot explicitly
+    // via openDevice() once it knows a real controller is connected for that player, instead
+    // of this service auto-opening one fixed device at construction time.
+    private val MAX_PLAYERS = 2
+    private val uinputFds = IntArray(MAX_PLAYERS) { -1 }
 
     // Shizuku ties this process's lifecycle to a clean unbind from the host app; an abnormal
     // host exit (force-stop, OOM kill on the TV box) skips that, orphaning this process forever
@@ -103,13 +108,30 @@ class GamepadInjectorService : IGamepadInjector.Stub() {
 
     init {
         killStaleSiblings()
-        // Name must NOT contain the substring "Virtual" -- RetroArch's Android input driver
-        // (input/drivers/android_input.c) hardcodes a special case that relabels any device
-        // whose name contains "Virtual" as "SHIELD Virtual Controller" (meant for the Shield
-        // remote's NVIDIA-button/CEC virtual device), which swallowed this controller's real
-        // identity and made it indistinguishable from that unrelated system device.
-        uinputFd = runCatching { nativeOpenUinput("8BitDo GIP Bridge Gamepad") }.getOrElse { -1 }
-        Log.d(TAG, "uinput gamepad fd=$uinputFd")
+    }
+
+    // Name must NOT contain the substring "Virtual" -- RetroArch's Android input driver
+    // (input/drivers/android_input.c) hardcodes a special case that relabels any device
+    // whose name contains "Virtual" as "SHIELD Virtual Controller" (meant for the Shield
+    // remote's NVIDIA-button/CEC virtual device), which swallowed this controller's real
+    // identity and made it indistinguishable from that unrelated system device — caller
+    // (GipBridgeService) is responsible for picking a name that avoids that substring, same
+    // as the existing default "8BitDo GIP Bridge Gamepad".
+    override fun openDevice(playerIndex: Int, name: String): Boolean {
+        if (playerIndex !in 0 until MAX_PLAYERS) { Log.e(TAG, "openDevice: bad playerIndex=$playerIndex"); return false }
+        if (uinputFds[playerIndex] >= 0) { Log.d(TAG, "openDevice: player $playerIndex already open, reusing"); return true }
+        val fd = runCatching { nativeOpenUinput(name) }.getOrElse { -1 }
+        uinputFds[playerIndex] = fd
+        Log.d(TAG, "uinput gamepad for player $playerIndex ('$name') fd=$fd")
+        return fd >= 0
+    }
+
+    override fun closeDevice(playerIndex: Int) {
+        if (playerIndex !in 0 until MAX_PLAYERS) return
+        stopRumble(playerIndex)
+        val fd = uinputFds[playerIndex]
+        if (fd >= 0) nativeCloseUinput(fd)
+        uinputFds[playerIndex] = -1
     }
 
     private val buttonMap = mapOf(
@@ -125,10 +147,11 @@ class GamepadInjectorService : IGamepadInjector.Stub() {
         KeyEvent.KEYCODE_BUTTON_SELECT to KEY_BACK,
     )
 
-    override fun injectKey(keyCode: Int, down: Boolean) {
+    override fun injectKey(playerIndex: Int, keyCode: Int, down: Boolean) {
         val btnCode = buttonMap[keyCode]
-        if (btnCode != null && uinputFd >= 0) {
-            nativeSendKey(uinputFd, btnCode, down)
+        val fd = uinputFds.getOrElse(playerIndex) { -1 }
+        if (btnCode != null && fd >= 0) {
+            nativeSendKey(fd, btnCode, down)
             return
         }
         // System keys (KEYCODE_HOME etc) — unchanged, confirmed-working reflection path.
@@ -148,30 +171,37 @@ class GamepadInjectorService : IGamepadInjector.Stub() {
     // LTRIGGER/RTRIGGER; Android's own JoystickInputMapper compat layer then derives
     // LTRIGGER/RTRIGGER from BRAKE/GAS for apps that read those instead. Not live-verified yet.
     override fun injectAxes(
+        playerIndex: Int,
         x: Float, y: Float, z: Float, rz: Float,
         ltrigger: Float, rtrigger: Float, hatX: Float, hatY: Float,
     ) {
-        if (uinputFd < 0) return
+        val fd = uinputFds.getOrElse(playerIndex) { -1 }
+        if (fd < 0) return
         fun stick(v: Float) = (v * 32767f).toInt().coerceIn(-32768, 32767)
         fun trig(v: Float) = (v * 1023f).toInt().coerceIn(0, 1023)
         nativeSendAxes(
-            uinputFd,
+            fd,
             stick(x), stick(y), stick(z), stick(rz),
             trig(rtrigger), trig(ltrigger),
             hatX.toInt().coerceIn(-1, 1), hatY.toInt().coerceIn(-1, 1),
         )
     }
 
-    @Volatile private var rumblePolling = false
-    private var rumbleThread: Thread? = null
+    // One poll thread per player slot — each uinput fd's FF events are independent, so a
+    // single shared thread/flag (the original single-controller design) would only ever
+    // service one player's rumble.
+    private val rumblePolling = BooleanArray(MAX_PLAYERS)
+    private val rumbleThreads = arrayOfNulls<Thread>(MAX_PLAYERS)
 
-    override fun startRumble(callback: IRumbleCallback) {
-        if (uinputFd < 0) { Log.e(TAG, "startRumble: no uinput device"); return }
-        if (rumblePolling) return
-        rumblePolling = true
-        rumbleThread = thread(name = "gip-ff-poll") {
-            while (rumblePolling) {
-                val packed = nativePollFF(uinputFd)
+    override fun startRumble(playerIndex: Int, callback: IRumbleCallback) {
+        if (playerIndex !in 0 until MAX_PLAYERS) { Log.e(TAG, "startRumble: bad playerIndex=$playerIndex"); return }
+        val fd = uinputFds.getOrElse(playerIndex) { -1 }
+        if (fd < 0) { Log.e(TAG, "startRumble: no uinput device for player $playerIndex"); return }
+        if (rumblePolling[playerIndex]) return
+        rumblePolling[playerIndex] = true
+        rumbleThreads[playerIndex] = thread(name = "gip-ff-poll-p$playerIndex") {
+            while (rumblePolling[playerIndex]) {
+                val packed = nativePollFF(fd)
                 if (packed < 0) { Thread.sleep(50); continue }
                 val type = (packed ushr 60) and 0x3L
                 if (type == 0L) continue
@@ -195,10 +225,11 @@ class GamepadInjectorService : IGamepadInjector.Stub() {
         }
     }
 
-    override fun stopRumble() {
-        rumblePolling = false
-        rumbleThread?.interrupt()
-        rumbleThread = null
+    override fun stopRumble(playerIndex: Int) {
+        if (playerIndex !in 0 until MAX_PLAYERS) return
+        rumblePolling[playerIndex] = false
+        rumbleThreads[playerIndex]?.interrupt()
+        rumbleThreads[playerIndex] = null
     }
 
     // KEYCODE_SETTINGS injection was tried first and confirmed live to fire with no error, but
@@ -225,10 +256,6 @@ class GamepadInjectorService : IGamepadInjector.Stub() {
     }
 
     override fun destroy() {
-        stopRumble()
-        if (uinputFd >= 0) {
-            nativeCloseUinput(uinputFd)
-            uinputFd = -1
-        }
+        for (i in 0 until MAX_PLAYERS) closeDevice(i)
     }
 }

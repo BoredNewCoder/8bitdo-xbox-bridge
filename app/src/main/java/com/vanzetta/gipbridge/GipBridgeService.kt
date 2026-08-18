@@ -62,47 +62,100 @@ class GipBridgeService : Service() {
     fun getLogHistory(): String = synchronized(logHistory) { logHistory.toString() }
 
     private lateinit var usbManager: UsbManager
-    private var readerThread: Thread? = null
-    private var gipInjectorThread: Thread? = null
-    @Volatile private var running = false
-    private var gipConnection: UsbDeviceConnection? = null
-    private var gipEpOut: UsbEndpoint? = null
-    // Single-slot mailbox, same decoupling fix applied to the sibling raphnet-gc-n64-bridge
-    // project: injectGamepadState()'s Shizuku Binder calls used to run inline on the USB
-    // reader thread, so a stalled IPC call could delay the next bulkTransfer read. Capacity 1
-    // + poll-before-offer keeps only the latest pending state.
-    private val gamepadQueue = java.util.concurrent.ArrayBlockingQueue<GamepadState>(1)
+
+    // Per-controller state, one instance per player slot (index 0 = player 1, 1 = player 2)
+    // — added for 2-controller support. Everything that used to be a single field on the
+    // service (connection, threads, dedup state, GIP sequence counter, rumble debounce) now
+    // lives here instead, so two physical controllers can run fully independent sessions
+    // without fighting over shared mutable state.
+    private inner class GipSession(val playerIndex: Int, val deviceName: String) {
+        var connection: UsbDeviceConnection? = null
+        var epOut: UsbEndpoint? = null
+        var readerThread: Thread? = null
+        var injectorThread: Thread? = null
+        @Volatile var running = false
+        val gamepadQueue = java.util.concurrent.ArrayBlockingQueue<GamepadState>(1)
+        var lastButtons = 0
+        var lastInputLogAtMs = 0L
+        var lastSentLX = 0; var lastSentLY = 0
+        var lastSentRX = 0; var lastSentRY = 0
+        var lastSentLT = 0; var lastSentRT = 0
+        var lastSentHatX = 0f; var lastSentHatY = 0f
+        var seq = 0
+        fun nextSeq(): Int { seq = (seq + 1) and 0xFF; if (seq == 0) seq = 1; return seq }
+        // Per-session Xbox-button long-press state — each controller's Guide button is
+        // independent, sharing one flag/runnable across two controllers would let one
+        // player's press cancel or misfire the other's.
+        var xboxLongPressFired = false
+        val xboxLongPressRunnable = Runnable {
+            xboxLongPressFired = true
+            log("XBOX BUTTON (player ${playerIndex + 1}): held -> opening Settings")
+            runCatching {
+                injector?.openSettings()
+            }.onFailure { log("Settings launch failed: ${it.message}") }
+        }
+        var lastLoggedRumbleState: Triple<Int, Int, Int>? = null
+        var pendingRumbleStop: Runnable? = null
+        // durationMs is currently always 0 from GamepadInjectorService (ff_replay.length
+        // parsing deferred) — treated as "play until stop", matched with a short repeat/rearm
+        // window since GIP rumble packets are one-shot with an explicit duration, not a
+        // persistent on/off state like Linux FF play/stop. Debouncing the stop (150ms) so a
+        // sustained effect's repeated re-uploads (confirmed live in Gran Turismo: ~65ms
+        // interval, tied to RPM) don't hard-cut and immediately restart the motor between
+        // refreshes, which felt like stuttering instead of smooth continuous rumble.
+        // Weak (small/high-freq) motor only, not both: confirmed live in Gran Turismo that
+        // RetroArch 1.22.2 OR-merges strong+weak into one identical value for both channels
+        // (its own dual-motor code path doesn't exist in this installed version), so sending
+        // to both fired equal magnitude on both motors — the weak motor alone reads as
+        // noticeably gentler at the same value.
+        val rumbleCallback = object : IRumbleCallback.Stub() {
+            override fun onRumble(strongPercent: Int, weakPercent: Int, durationMs: Int) {
+                pendingRumbleStop?.let { mainHandler.removeCallbacks(it) }
+                pendingRumbleStop = null
+                sendRumble(this@GipSession, strongPercent, weakPercent, if (durationMs > 0) durationMs else 200, GipMotor.RIGHT)
+            }
+            override fun onRumbleStop() {
+                pendingRumbleStop?.let { mainHandler.removeCallbacks(it) }
+                val stop = Runnable {
+                    sendRumble(this@GipSession, 0, 0, 0, GipMotor.RIGHT)
+                    pendingRumbleStop = null
+                }
+                pendingRumbleStop = stop
+                mainHandler.postDelayed(stop, 150)
+            }
+        }
+    }
+
+    // Index 0 = player 1 (original single-controller slot, same default device name as
+    // before this change — an existing single-controller user's RetroArch/Dolphin autoconfig
+    // binding keeps working with zero changes needed on their end). Index 1 = player 2, only
+    // used once DeviceConfig.controller2Configured() is true.
+    private val sessions = arrayOfNulls<GipSession>(2)
 
     // Read fresh each call (not cached) so a config change via SettingsActivity takes
-    // effect on the next USB attach event without needing a service restart.
-    private fun isController(device: UsbDevice) =
-        device.vendorId == DeviceConfig.controllerVid(this) && device.productId == DeviceConfig.controllerPid(this)
+    // effect on the next USB attach event without needing a service restart. Returns the
+    // player index (0/1) a device matches, or -1 if it matches neither controller slot.
+    private fun controllerPlayerIndex(device: UsbDevice): Int = when {
+        device.vendorId == DeviceConfig.controllerVid(this) && device.productId == DeviceConfig.controllerPid(this) -> 0
+        DeviceConfig.controller2Configured(this) &&
+            device.vendorId == DeviceConfig.controller2Vid(this) && device.productId == DeviceConfig.controller2Pid(this) -> 1
+        else -> -1
+    }
     private fun isHeadset(device: UsbDevice) =
         device.vendorId == DeviceConfig.headsetVid(this) && device.productId == DeviceConfig.headsetPid(this)
 
     @Volatile private var injector: IGamepadInjector? = null
-    private var lastButtons = 0
-    // Analog axes wobble every poll during active stick movement, so equality-based dedup
-    // (like sendRumble's) never suppresses anything here — throttle by time instead. Unthrottled
-    // this was Log.d + StringBuilder append at ~250Hz while a stick was held off-center.
-    private var lastInputLogAtMs = 0L
 
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var xboxLongPressFired = false
-    private val xboxLongPressRunnable = Runnable {
-        xboxLongPressFired = true
-        log("XBOX BUTTON: held -> opening Settings")
-        // Confirmed live: startActivity(ACTION_SETTINGS) from here gets silently blocked by
-        // Android's background-activity-launch restriction ("Background activity start...
-        // isCallingUidForeground: false") — a foreground Service has no visible window, so it
-        // doesn't qualify to launch an Activity directly. Tried KEYCODE_SETTINGS injection next
-        // (works for HOME) but this Shield's launcher doesn't intercept that keycode, so
-        // RetroArch just swallowed it. Launching from the Shizuku shell-UID process instead —
-        // that UID has real activity-start privileges.
-        runCatching {
-            injector?.openSettings()
-        }.onFailure { log("Settings launch failed: ${it.message}") }
-    }
+    // Confirmed live: startActivity(ACTION_SETTINGS) from here gets silently blocked by
+    // Android's background-activity-launch restriction ("Background activity start...
+    // isCallingUidForeground: false") — a foreground Service has no visible window, so it
+    // doesn't qualify to launch an Activity directly. Tried KEYCODE_SETTINGS injection next
+    // (works for HOME) but this Shield's launcher doesn't intercept that keycode, so
+    // RetroArch just swallowed it. Launching from the Shizuku shell-UID process instead —
+    // that UID has real activity-start privileges. (Runnable itself now lives per-session,
+    // see GipSession.xboxLongPressRunnable — this comment stays here since it explains a
+    // shared design decision, not session-specific state.)
 
     // Bump this on every release that touches GamepadInjectorService/uinput_gamepad.c --
     // Shizuku reuses a cached injector process across app updates when this doesn't change,
@@ -112,49 +165,20 @@ class GipBridgeService : Service() {
         ComponentName(BuildConfig.APPLICATION_ID, GamepadInjectorService::class.java.name)
     ).daemon(false).processNameSuffix("injector").debuggable(false).version(2)
 
-    // Runs on a binder thread from the Shizuku process's FF poll loop. durationMs is currently
-    // always 0 from GamepadInjectorService (ff_replay.length parsing deferred) — treated as
-    // "play until stop", matched with a short repeat/rearm window since GIP rumble packets are
-    // one-shot with an explicit duration, not a persistent on/off state like Linux FF play/stop.
-    // Confirmed live in Gran Turismo: the core re-uploads/re-plays the rumble effect on a
-    // timer (~65ms interval) instead of one long-running effect — normal for a "continuous
-    // while accelerating" engine sound tied to RPM. Each play already carries its own hardware
-    // duration, so sending an explicit motor-stop between every refresh hard-cuts the motor
-    // and immediately restarts it, which feels like stuttering/"rumbling like crazy" instead of
-    // smooth continuous rumble. Debouncing the stop: delay it briefly and cancel if a new
-    // onRumble() arrives first, so back-to-back refreshes never actually zero the motor.
-    private var pendingRumbleStop: Runnable? = null
-    private val rumbleCallback = object : IRumbleCallback.Stub() {
-        override fun onRumble(strongPercent: Int, weakPercent: Int, durationMs: Int) {
-            pendingRumbleStop?.let { mainHandler.removeCallbacks(it) }
-            pendingRumbleStop = null
-            // Weak (small/high-freq) motor only. Real game rumble stays off the trigger
-            // motors — Linux's standard FF_RUMBLE effect (what RetroArch/games actually send)
-            // only has 2 channels with no way to address triggers separately anyway. Also off
-            // the strong (large/low-freq) motor by request: confirmed live in Gran Turismo that
-            // RetroArch 1.22.2 OR-merges strong+weak into one identical value for both
-            // channels (its own dual-motor code path doesn't exist in this version — confirmed
-            // against the real installed build's source), so both motors were firing at equal
-            // magnitude — the weak motor alone reads as noticeably gentler at the same value.
-            sendRumble(strongPercent, weakPercent, if (durationMs > 0) durationMs else 200, GipMotor.RIGHT)
-        }
-        override fun onRumbleStop() {
-            pendingRumbleStop?.let { mainHandler.removeCallbacks(it) }
-            val stop = Runnable {
-                sendRumble(0, 0, 0, GipMotor.RIGHT)
-                pendingRumbleStop = null
-            }
-            pendingRumbleStop = stop
-            mainHandler.postDelayed(stop, 150)
-        }
-    }
-
     private val userServiceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             injector = IGamepadInjector.Stub.asInterface(binder)
             log("Shizuku injector service connected.")
-            runCatching { injector?.startRumble(rumbleCallback) }
-                .onFailure { log("startRumble registration failed: ${it.message}") }
+            // Re-arm every currently-running session against the (possibly freshly
+            // respawned) injector process — covers the case where the injector process died
+            // and reconnected while a controller was already mid-session, not just the
+            // normal startup ordering where sessions start after this fires.
+            for (session in sessions) {
+                if (session == null) continue
+                runCatching { injector?.openDevice(session.playerIndex, session.deviceName) }
+                runCatching { injector?.startRumble(session.playerIndex, session.rumbleCallback) }
+                    .onFailure { log("startRumble registration failed for player ${session.playerIndex}: ${it.message}") }
+            }
         }
         override fun onServiceDisconnected(name: ComponentName) {
             injector = null
@@ -199,8 +223,9 @@ class GipBridgeService : Service() {
                 val device: UsbDevice? = intent.getParcelableExtraCompat(UsbManager.EXTRA_DEVICE)
                 if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false) && device != null) {
                     log("USB permission granted for ${device.deviceName}")
+                    val playerIndex = controllerPlayerIndex(device)
                     if (isHeadset(device)) startG733Session(device)
-                    else if (isController(device)) startGipSession(device)
+                    else if (playerIndex >= 0) startGipSession(device, playerIndex)
                 } else {
                     log("USB permission DENIED")
                 }
@@ -210,16 +235,19 @@ class GipBridgeService : Service() {
 
     // Fires a real GIP rumble packet straight at the controller, bypassing uinput/FF/RetroArch
     // entirely — isolates whether a "rumble doesn't work" report is our GIP packet path or
-    // the RetroArch/Android InputDevice-vibrator integration layer.
+    // the RetroArch/Android InputDevice-vibrator integration layer. Debug tooling only, kept
+    // targeting player 1 (session index 0) — not worth doubling every diagnostic broadcast
+    // for player 2 too, this is for isolating the GIP packet path itself, not per-player QA.
     private val testRumbleReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
+            val session = sessions[0] ?: run { log("Test rumble: no player 1 session running"); return }
             log("Test rumble sequence: large motor, small motor, left trigger, right trigger, all together.")
             thread(name = "test-rumble-sequence") {
                 fun pulse(label: String, motors: Int) {
                     log("Test rumble: $label")
-                    sendRumble(100, 100, 700, motors)
+                    sendRumble(session, 100, 100, 700, motors)
                     Thread.sleep(700)
-                    sendRumble(0, 0, 0, motors)
+                    sendRumble(session, 0, 0, 0, motors)
                     Thread.sleep(600)
                 }
                 pulse("LEFT (large/strong) motor only", GipMotor.LEFT)
@@ -241,9 +269,9 @@ class GipBridgeService : Service() {
             log("Test SELECT hold (via real uinput device) triggered.")
             thread(name = "test-select-hold") {
                 runCatching {
-                    injector?.injectKey(KeyEvent.KEYCODE_BUTTON_SELECT, true)
+                    injector?.injectKey(0, KeyEvent.KEYCODE_BUTTON_SELECT, true)
                     Thread.sleep(2500)
-                    injector?.injectKey(KeyEvent.KEYCODE_BUTTON_SELECT, false)
+                    injector?.injectKey(0, KeyEvent.KEYCODE_BUTTON_SELECT, false)
                 }.onFailure { log("Test SELECT hold failed: ${it.message}") }
             }
         }
@@ -260,14 +288,14 @@ class GipBridgeService : Service() {
             val inj = injector ?: return
             runCatching {
                 when (key) {
-                    "UP" -> { inj.injectAxes(0f, 0f, 0f, 0f, 0f, 0f, 0f, -1f); Thread.sleep(150); inj.injectAxes(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f) }
-                    "DOWN" -> { inj.injectAxes(0f, 0f, 0f, 0f, 0f, 0f, 0f, 1f); Thread.sleep(150); inj.injectAxes(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f) }
-                    "LEFT" -> { inj.injectAxes(0f, 0f, 0f, 0f, 0f, 0f, -1f, 0f); Thread.sleep(150); inj.injectAxes(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f) }
-                    "RIGHT" -> { inj.injectAxes(0f, 0f, 0f, 0f, 0f, 0f, 1f, 0f); Thread.sleep(150); inj.injectAxes(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f) }
-                    "A" -> { inj.injectKey(KeyEvent.KEYCODE_BUTTON_A, true); Thread.sleep(100); inj.injectKey(KeyEvent.KEYCODE_BUTTON_A, false) }
-                    "B" -> { inj.injectKey(KeyEvent.KEYCODE_BUTTON_B, true); Thread.sleep(100); inj.injectKey(KeyEvent.KEYCODE_BUTTON_B, false) }
-                    "START" -> { inj.injectKey(KeyEvent.KEYCODE_BUTTON_START, true); Thread.sleep(100); inj.injectKey(KeyEvent.KEYCODE_BUTTON_START, false) }
-                    "SELECT" -> { inj.injectKey(KeyEvent.KEYCODE_BUTTON_SELECT, true); Thread.sleep(100); inj.injectKey(KeyEvent.KEYCODE_BUTTON_SELECT, false) }
+                    "UP" -> { inj.injectAxes(0, 0f, 0f, 0f, 0f, 0f, 0f, 0f, -1f); Thread.sleep(150); inj.injectAxes(0, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f) }
+                    "DOWN" -> { inj.injectAxes(0, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 1f); Thread.sleep(150); inj.injectAxes(0, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f) }
+                    "LEFT" -> { inj.injectAxes(0, 0f, 0f, 0f, 0f, 0f, 0f, -1f, 0f); Thread.sleep(150); inj.injectAxes(0, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f) }
+                    "RIGHT" -> { inj.injectAxes(0, 0f, 0f, 0f, 0f, 0f, 0f, 1f, 0f); Thread.sleep(150); inj.injectAxes(0, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f) }
+                    "A" -> { inj.injectKey(0, KeyEvent.KEYCODE_BUTTON_A, true); Thread.sleep(100); inj.injectKey(0, KeyEvent.KEYCODE_BUTTON_A, false) }
+                    "B" -> { inj.injectKey(0, KeyEvent.KEYCODE_BUTTON_B, true); Thread.sleep(100); inj.injectKey(0, KeyEvent.KEYCODE_BUTTON_B, false) }
+                    "START" -> { inj.injectKey(0, KeyEvent.KEYCODE_BUTTON_START, true); Thread.sleep(100); inj.injectKey(0, KeyEvent.KEYCODE_BUTTON_START, false) }
+                    "SELECT" -> { inj.injectKey(0, KeyEvent.KEYCODE_BUTTON_SELECT, true); Thread.sleep(100); inj.injectKey(0, KeyEvent.KEYCODE_BUTTON_SELECT, false) }
                 }
             }.onFailure { log("Test nav failed: ${it.message}") }
         }
@@ -312,7 +340,7 @@ class GipBridgeService : Service() {
     private val usbAttachReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             val device: UsbDevice? = intent.getParcelableExtraCompat(UsbManager.EXTRA_DEVICE)
-            if (device != null && (isController(device) || isHeadset(device))) {
+            if (device != null && (controllerPlayerIndex(device) >= 0 || isHeadset(device))) {
                 log("Attach event: ${device.deviceName} (vid=${device.vendorId} pid=${device.productId})")
                 requestPermissionAndConnect(device)
             }
@@ -321,14 +349,15 @@ class GipBridgeService : Service() {
 
     // Without this, unplugging mid-session leaves the read loop spinning on repeated
     // failed transfers with nothing telling it to stop — the connection/interface are
-    // gone but `running`/`g733Running` stay true until the app itself is killed.
+    // gone but a session's `running`/`g733Running` stay true until the app itself is killed.
     private val usbDetachReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             val device: UsbDevice? = intent.getParcelableExtraCompat(UsbManager.EXTRA_DEVICE)
             if (device == null) return
-            if (isController(device)) {
-                log("Controller detached.")
-                stopGipSession()
+            val playerIndex = controllerPlayerIndex(device)
+            if (playerIndex >= 0) {
+                log("Controller (player ${playerIndex + 1}) detached.")
+                stopGipSession(playerIndex)
             } else if (isHeadset(device)) {
                 log("Headset detached.")
                 stopG733Session()
@@ -365,10 +394,13 @@ class GipBridgeService : Service() {
         Shizuku.addRequestPermissionResultListener(shizukuPermissionListener)
         Shizuku.addBinderReceivedListenerSticky { setupShizuku() }
 
+        val c2 = if (DeviceConfig.controller2Configured(this))
+            "controller 2 (vid=${DeviceConfig.controller2Vid(this)} pid=${DeviceConfig.controller2Pid(this)})"
+        else "controller 2 (not configured)"
         log(
-            "GIP Bridge service started. Looking for controller " +
-                "(vid=${DeviceConfig.controllerVid(this)} pid=${DeviceConfig.controllerPid(this)}) " +
-                "and headset (vid=${DeviceConfig.headsetVid(this)} pid=${DeviceConfig.headsetPid(this)})..."
+            "GIP Bridge service started. Looking for controller 1 " +
+                "(vid=${DeviceConfig.controllerVid(this)} pid=${DeviceConfig.controllerPid(this)}), " +
+                "$c2, and headset (vid=${DeviceConfig.headsetVid(this)} pid=${DeviceConfig.headsetPid(this)})..."
         )
         findAndConnectExisting()
     }
@@ -396,7 +428,7 @@ class GipBridgeService : Service() {
     }
 
     private fun findAndConnectExisting() {
-        val targets = usbManager.deviceList.values.filter { isController(it) || isHeadset(it) }
+        val targets = usbManager.deviceList.values.filter { controllerPlayerIndex(it) >= 0 || isHeadset(it) }
         if (targets.isEmpty()) {
             log("No target device currently attached. Plug it in (attach receiver will catch it).")
             return
@@ -409,7 +441,8 @@ class GipBridgeService : Service() {
 
     private fun requestPermissionAndConnect(device: UsbDevice) {
         if (usbManager.hasPermission(device)) {
-            if (isHeadset(device)) startG733Session(device) else if (isController(device)) startGipSession(device)
+            val playerIndex = controllerPlayerIndex(device)
+            if (isHeadset(device)) startG733Session(device) else if (playerIndex >= 0) startGipSession(device, playerIndex)
             return
         }
         // Confirmed live: requesting permission while nothing is in the foreground (TV
@@ -428,8 +461,37 @@ class GipBridgeService : Service() {
         log("Requested USB permission, waiting for user/system response...")
     }
 
-    private fun startGipSession(device: UsbDevice) {
-        if (running) { log("Session already running, ignoring duplicate start."); return }
+    // Real model names for the 8BitDo VID/PID combos confirmed live this session (see
+    // GipBridge's own ANNOUNCE captures, cross-checked against dumpsys usb's vendor_id/
+    // product_id — identical). Falls back to a raw vid/pid string for anything not in this
+    // table — a future/unrecognized 8BitDo model still gets bridged, just without a friendly
+    // name, rather than failing outright.
+    // Note: this changes player 1's device name from the old plain "8BitDo GIP Bridge
+    // Gamepad" to include the model suffix too — an existing single-controller user's saved
+    // RetroArch/Dolphin autoconfig profile (keyed by the old exact name) needs a one-time
+    // re-bind after this update, the real cost of both players getting a genuinely
+    // distinguishable name instead of one staying silently generic.
+    private val KNOWN_MODELS = mapOf(
+        (11720 to 8213) to "Ultimate Wired Controller for Xbox",
+        (11720 to 8192) to "Pro 2 Wired Controller for Xbox",
+    )
+    private fun modelNameFor(vendorId: Int, productId: Int): String {
+        val model = KNOWN_MODELS[vendorId to productId] ?: "vid$vendorId pid$productId"
+        return "8BitDo GIP Bridge Gamepad ($model)"
+    }
+
+    private fun startGipSession(device: UsbDevice, playerIndex: Int) {
+        if (sessions[playerIndex] != null) { log("Player ${playerIndex + 1} session already running, ignoring duplicate start."); return }
+        // Real model name resolved immediately from the standard Android USB device
+        // descriptor (device.vendorId/productId) — no need to wait for the GIP-level
+        // ANNOUNCE packet, which turned out unreliable to depend on: a controller that had
+        // already completed its GIP handshake earlier in the session (still plugged in, just
+        // this app restarting) never resends ANNOUNCE, so an ANNOUNCE-gated open left that
+        // session's uinput device permanently unopened — confirmed live, player 2 never got a
+        // device at all this way. dumpsys usb's vendor_id/product_id already matches the GIP
+        // ANNOUNCE payload's fields exactly (cross-checked live), so this is equally accurate
+        // and available the instant the device is found, not conditional on firmware behavior.
+        val session = GipSession(playerIndex, modelNameFor(device.vendorId, device.productId))
 
         // Interface 0 is the interrupt-based GIP command/input channel (captured live via
         // `adb shell dumpsys usb`: class=255 subclass=71 protocol=208, IN ep addr=0x82,
@@ -470,32 +532,38 @@ class GipBridgeService : Service() {
             log("Interface 1 alt=0 not found (unexpected)")
         }
 
-        log("Interface claimed. IN ep=0x${epIn.address.toString(16)} OUT ep=0x${epOut.address.toString(16)}. Starting read loop...")
-        gipConnection = connection
-        gipEpOut = epOut
-        running = true
-        readerThread = thread(name = "gip-reader") { readLoop(connection, epIn, epOut) }
-        gipInjectorThread = thread(name = "gip-injector") { gipInjectLoop() }
+        log("Interface claimed (player ${playerIndex + 1}). IN ep=0x${epIn.address.toString(16)} OUT ep=0x${epOut.address.toString(16)}. Starting read loop...")
+        log("Opening uinput device for player ${playerIndex + 1} as '${session.deviceName}'")
+        session.connection = connection
+        session.epOut = epOut
+        session.running = true
+        sessions[playerIndex] = session
+
+        runCatching { injector?.openDevice(playerIndex, session.deviceName) }
+        runCatching { injector?.startRumble(playerIndex, session.rumbleCallback) }
+            .onFailure { log("startRumble registration failed for player ${playerIndex + 1}: ${it.message}") }
+
+        session.readerThread = thread(name = "gip-reader-p$playerIndex") { readLoop(session, connection, epIn, epOut) }
+        session.injectorThread = thread(name = "gip-injector-p$playerIndex") { gipInjectLoop(session) }
     }
 
-    private fun stopGipSession() {
-        running = false
-        readerThread?.join(500)
-        gipInjectorThread?.join(500)
-        runCatching { gipConnection?.close() }
-        gipConnection = null
-        gipEpOut = null
-        readerThread = null
-        gipInjectorThread = null
+    private fun stopGipSession(playerIndex: Int) {
+        val session = sessions[playerIndex] ?: return
+        session.running = false
+        session.readerThread?.join(500)
+        session.injectorThread?.join(500)
+        runCatching { session.connection?.close() }
+        runCatching { injector?.closeDevice(playerIndex) }
+        sessions[playerIndex] = null
     }
 
-    private fun gipInjectLoop() {
-        while (running) {
+    private fun gipInjectLoop(session: GipSession) {
+        while (session.running) {
             val state = runCatching {
-                gamepadQueue.poll(200, java.util.concurrent.TimeUnit.MILLISECONDS)
+                session.gamepadQueue.poll(200, java.util.concurrent.TimeUnit.MILLISECONDS)
             }.getOrNull() ?: continue
-            runCatching { injectGamepadState(state) }
-                .onFailure { log("inject failed: ${it.message}") }
+            runCatching { injectGamepadState(session, state) }
+                .onFailure { log("inject failed for player ${session.playerIndex + 1}: ${it.message}") }
         }
     }
 
@@ -505,11 +573,12 @@ class GipBridgeService : Service() {
     // an uncaught exception on ANY thread (this reader thread included) kills the WHOLE app,
     // not just this loop. Wrapping the whole iteration means one bad transfer/packet just
     // gets logged and retried on the next iteration, not fatal.
-    private fun readLoop(conn: UsbDeviceConnection, epIn: UsbEndpoint, epOut: UsbEndpoint) {
+    private fun readLoop(session: GipSession, conn: UsbDeviceConnection, epIn: UsbEndpoint, epOut: UsbEndpoint) {
         val buf = ByteArray(256)
         var packetsSeen = 0
         var inputPacketsSeen = 0
-        while (running) {
+        val pi = session.playerIndex
+        while (session.running) {
           try {
             val n = conn.bulkTransfer(epIn, buf, buf.size, 2000)
             // n<=0 also happens on a genuine detach (immediate failure, not a timeout) —
@@ -522,7 +591,7 @@ class GipBridgeService : Service() {
             val (hdr, hdrLen) = try {
                 decodeGipHeader(data)
             } catch (e: Exception) {
-                log("decode error on ${n}B packet: ${e.message} raw=${data.toHex()}")
+                log("decode error on ${n}B packet (player ${pi + 1}): ${e.message} raw=${data.toHex()}")
                 continue
             }
             val payload = if (data.size > hdrLen) data.copyOfRange(hdrLen, data.size) else ByteArray(0)
@@ -530,40 +599,40 @@ class GipBridgeService : Service() {
             when {
                 hdr.isInternal && hdr.command == GipCommand.ANNOUNCE -> {
                     val ann = parseAnnounce(payload)
-                    log("ANNOUNCE: vid=${ann?.vendorId} pid=${ann?.productId} fw=${ann?.fwMajor}.${ann?.fwMinor}.${ann?.fwBuild}.${ann?.fwRevision} needsAck=${hdr.needsAck}")
-                    sendAck(conn, epOut, hdr)
-                    sendPowerOn(conn, epOut)
-                    sendIdentifyRequest(conn, epOut)
+                    log("ANNOUNCE (player ${pi + 1}): vid=${ann?.vendorId} pid=${ann?.productId} fw=${ann?.fwMajor}.${ann?.fwMinor}.${ann?.fwBuild}.${ann?.fwRevision} needsAck=${hdr.needsAck}")
+                    sendAck(session, conn, epOut, hdr)
+                    sendPowerOn(session, conn, epOut)
+                    sendIdentifyRequest(session, conn, epOut)
                 }
                 hdr.isInternal && hdr.command == GipCommand.STATUS -> {
-                    log("STATUS: ${payload.toHex()} needsAck=${hdr.needsAck}")
-                    sendAck(conn, epOut, hdr)
+                    log("STATUS (player ${pi + 1}): ${payload.toHex()} needsAck=${hdr.needsAck}")
+                    sendAck(session, conn, epOut, hdr)
                 }
                 hdr.isInternal && hdr.command == GipCommand.VIRTUAL_KEY -> {
                     if (payload.size >= 2) {
                         val down = payload[0].toInt() != 0
                         val key = payload[1].toInt() and 0xFF
                         if (key == 0x5b) {
-                            log("XBOX BUTTON: ${if (down) "DOWN" else "UP"}")
+                            log("XBOX BUTTON (player ${pi + 1}): ${if (down) "DOWN" else "UP"}")
                             if (down) {
-                                xboxLongPressFired = false
-                                mainHandler.postDelayed(xboxLongPressRunnable, XBOX_LONG_PRESS_MS)
+                                session.xboxLongPressFired = false
+                                mainHandler.postDelayed(session.xboxLongPressRunnable, XBOX_LONG_PRESS_MS)
                             } else {
-                                mainHandler.removeCallbacks(xboxLongPressRunnable)
-                                if (!xboxLongPressFired) {
+                                mainHandler.removeCallbacks(session.xboxLongPressRunnable)
+                                if (!session.xboxLongPressFired) {
                                     runCatching {
-                                        injector?.injectKey(KeyEvent.KEYCODE_HOME, true)
-                                        injector?.injectKey(KeyEvent.KEYCODE_HOME, false)
-                                    }.onFailure { log("inject XBOX button failed: ${it.message}") }
+                                        injector?.injectKey(pi, KeyEvent.KEYCODE_HOME, true)
+                                        injector?.injectKey(pi, KeyEvent.KEYCODE_HOME, false)
+                                    }.onFailure { log("inject XBOX button failed (player ${pi + 1}): ${it.message}") }
                                 }
                             }
-                        } else log("virtual key 0x${key.toString(16)}: ${if (down) "DOWN" else "UP"}")
+                        } else log("virtual key 0x${key.toString(16)} (player ${pi + 1}): ${if (down) "DOWN" else "UP"}")
                     }
-                    sendAck(conn, epOut, hdr)
+                    sendAck(session, conn, epOut, hdr)
                 }
                 hdr.isInternal -> {
-                    log("internal cmd=0x${hdr.command.toString(16)} opts=0x${hdr.options.toString(16)} len=${payload.size} raw=${payload.toHex()} needsAck=${hdr.needsAck}")
-                    sendAck(conn, epOut, hdr)
+                    log("internal cmd=0x${hdr.command.toString(16)} opts=0x${hdr.options.toString(16)} len=${payload.size} raw=${payload.toHex()} needsAck=${hdr.needsAck} (player ${pi + 1})")
+                    sendAck(session, conn, epOut, hdr)
                 }
                 hdr.command == GipCommand.INPUT -> {
                     inputPacketsSeen++
@@ -572,28 +641,28 @@ class GipBridgeService : Service() {
                             kotlin.math.abs(state.stickLeftX) > 3000 || kotlin.math.abs(state.stickLeftY) > 3000 ||
                             kotlin.math.abs(state.stickRightX) > 3000 || kotlin.math.abs(state.stickRightY) > 3000)) {
                         val now = SystemClock.elapsedRealtime()
-                        if (now - lastInputLogAtMs >= INPUT_LOG_THROTTLE_MS) {
-                            log("INPUT: ${state.describe()}")
-                            lastInputLogAtMs = now
+                        if (now - session.lastInputLogAtMs >= INPUT_LOG_THROTTLE_MS) {
+                            log("INPUT (player ${pi + 1}): ${state.describe()}")
+                            session.lastInputLogAtMs = now
                         }
                     } else if (inputPacketsSeen <= 2) {
-                        log("INPUT #$inputPacketsSeen idle (${payload.size}B)")
+                        log("INPUT #$inputPacketsSeen idle (${payload.size}B) (player ${pi + 1})")
                     }
                     if (state != null) {
-                        gamepadQueue.poll() // drop any stale unconsumed state, keep only latest
-                        gamepadQueue.offer(state)
+                        session.gamepadQueue.poll() // drop any stale unconsumed state, keep only latest
+                        session.gamepadQueue.offer(state)
                     }
                 }
                 else -> {
-                    log("unhandled cmd=0x${hdr.command.toString(16)} opts=0x${hdr.options.toString(16)} raw=${payload.toHex()}")
+                    log("unhandled cmd=0x${hdr.command.toString(16)} opts=0x${hdr.options.toString(16)} raw=${payload.toHex()} (player ${pi + 1})")
                 }
             }
           } catch (e: Throwable) {
-            log("readLoop iteration failed: ${e.message}")
+            log("readLoop iteration failed (player ${pi + 1}): ${e.message}")
             Thread.sleep(50)
           }
         }
-        log("Read loop stopped after $packetsSeen packets ($inputPacketsSeen INPUT).")
+        log("Read loop stopped after $packetsSeen packets ($inputPacketsSeen INPUT) (player ${pi + 1}).")
     }
 
     // Real idle-CPU/IPC fix (same class of bug already found+fixed in the sibling
@@ -604,20 +673,17 @@ class GipBridgeService : Service() {
     // of activity. Deadzone thresholds are raw pre-normalization units (sticks: ~1% of the
     // full -32767..32767 range; triggers: ~1.5% of 0..1023), sized to absorb ADC noise
     // without masking a real small stick movement.
-    private var lastSentLX = 0; private var lastSentLY = 0
-    private var lastSentRX = 0; private var lastSentRY = 0
-    private var lastSentLT = 0; private var lastSentRT = 0
-    private var lastSentHatX = 0f; private var lastSentHatY = 0f
     private val STICK_DEADZONE = 300
     private val TRIGGER_DEADZONE = 15
 
-    private fun injectGamepadState(state: GamepadState) {
+    private fun injectGamepadState(session: GipSession, state: GamepadState) {
         val inj = injector ?: return
+        val pi = session.playerIndex
 
-        val changed = state.buttons xor lastButtons
+        val changed = state.buttons xor session.lastButtons
         if (changed != 0) {
             fun key(mask: Int, code: Int) {
-                if (changed and mask != 0) inj.injectKey(code, state.buttons and mask != 0)
+                if (changed and mask != 0) inj.injectKey(pi, code, state.buttons and mask != 0)
             }
             key(GipButton.A, KeyEvent.KEYCODE_BUTTON_A)
             key(GipButton.B, KeyEvent.KEYCODE_BUTTON_B)
@@ -629,7 +695,7 @@ class GipBridgeService : Service() {
             key(GipButton.STICK_R, KeyEvent.KEYCODE_BUTTON_THUMBR)
             key(GipButton.MENU, KeyEvent.KEYCODE_BUTTON_START)
             key(GipButton.VIEW, KeyEvent.KEYCODE_BUTTON_SELECT)
-            lastButtons = state.buttons
+            session.lastButtons = state.buttons
         }
 
         val hatX = when {
@@ -644,13 +710,14 @@ class GipBridgeService : Service() {
         }
 
         fun moved(a: Int, b: Int, deadzone: Int) = kotlin.math.abs(a - b) > deadzone
-        val axesChanged = hatX != lastSentHatX || hatY != lastSentHatY ||
-            moved(state.stickLeftX, lastSentLX, STICK_DEADZONE) || moved(state.stickLeftY, lastSentLY, STICK_DEADZONE) ||
-            moved(state.stickRightX, lastSentRX, STICK_DEADZONE) || moved(state.stickRightY, lastSentRY, STICK_DEADZONE) ||
-            moved(state.triggerLeft, lastSentLT, TRIGGER_DEADZONE) || moved(state.triggerRight, lastSentRT, TRIGGER_DEADZONE)
+        val axesChanged = hatX != session.lastSentHatX || hatY != session.lastSentHatY ||
+            moved(state.stickLeftX, session.lastSentLX, STICK_DEADZONE) || moved(state.stickLeftY, session.lastSentLY, STICK_DEADZONE) ||
+            moved(state.stickRightX, session.lastSentRX, STICK_DEADZONE) || moved(state.stickRightY, session.lastSentRY, STICK_DEADZONE) ||
+            moved(state.triggerLeft, session.lastSentLT, TRIGGER_DEADZONE) || moved(state.triggerRight, session.lastSentRT, TRIGGER_DEADZONE)
 
         if (axesChanged) {
             inj.injectAxes(
+                pi,
                 state.stickLeftX / 32767f,
                 -state.stickLeftY / 32767f, // confirmed live: inverted (down read as up) via the real uinput device — old injectInputEvent path didn't have this issue
                 state.stickRightX / 32767f,
@@ -660,17 +727,14 @@ class GipBridgeService : Service() {
                 hatX,
                 hatY,
             )
-            lastSentLX = state.stickLeftX; lastSentLY = state.stickLeftY
-            lastSentRX = state.stickRightX; lastSentRY = state.stickRightY
-            lastSentLT = state.triggerLeft; lastSentRT = state.triggerRight
-            lastSentHatX = hatX; lastSentHatY = hatY
+            session.lastSentLX = state.stickLeftX; session.lastSentLY = state.stickLeftY
+            session.lastSentRX = state.stickRightX; session.lastSentRY = state.stickRightY
+            session.lastSentLT = state.triggerLeft; session.lastSentRT = state.triggerRight
+            session.lastSentHatX = hatX; session.lastSentHatY = hatY
         }
     }
 
-    private var seq = 0
-    private fun nextSeq(): Int { seq = (seq + 1) and 0xFF; if (seq == 0) seq = 1; return seq }
-
-    private fun sendAck(conn: UsbDeviceConnection, epOut: UsbEndpoint, acked: GipHeader) {
+    private fun sendAck(session: GipSession, conn: UsbDeviceConnection, epOut: UsbEndpoint, acked: GipHeader) {
         val payload = buildAcknowledgePayload(acked.command, clientId = 0, totalLen = acked.packetLength)
         val hdr = GipHeader(
             command = GipCommand.ACKNOWLEDGE,
@@ -681,36 +745,34 @@ class GipBridgeService : Service() {
         writePacket(conn, epOut, hdr, payload)
     }
 
-    private fun sendPowerOn(conn: UsbDeviceConnection, epOut: UsbEndpoint) {
+    private fun sendPowerOn(session: GipSession, conn: UsbDeviceConnection, epOut: UsbEndpoint) {
         val payload = byteArrayOf(0x00) // GIP_PWR_ON
         val hdr = GipHeader(
             command = GipCommand.POWER,
             options = GipOption.INTERNAL,
-            sequence = nextSeq(),
+            sequence = session.nextSeq(),
             packetLength = payload.size,
         )
         writePacket(conn, epOut, hdr, payload)
-        log("Sent POWER=ON")
+        log("Sent POWER=ON (player ${session.playerIndex + 1})")
     }
 
-    private fun sendIdentifyRequest(conn: UsbDeviceConnection, epOut: UsbEndpoint) {
+    private fun sendIdentifyRequest(session: GipSession, conn: UsbDeviceConnection, epOut: UsbEndpoint) {
         val hdr = GipHeader(
             command = GipCommand.IDENTIFY,
             options = GipOption.INTERNAL,
-            sequence = nextSeq(),
+            sequence = session.nextSeq(),
             packetLength = 0,
         )
         writePacket(conn, epOut, hdr, ByteArray(0))
-        log("Sent IDENTIFY request")
+        log("Sent IDENTIFY request (player ${session.playerIndex + 1})")
     }
 
     // strongPercent/weakPercent are 0-100, scaled down further by the user's configured
     // rumble strength. durationMs=0 sends an explicit stop (all motors off).
-    private var lastLoggedRumbleState: Triple<Int, Int, Int>? = null
-
-    private fun sendRumble(strongPercent: Int, weakPercent: Int, durationMs: Int, motors: Int = GipMotor.ALL) {
-        val conn = gipConnection ?: run { log("sendRumble: no gipConnection, skipping"); return }
-        val epOut = gipEpOut ?: run { log("sendRumble: no gipEpOut, skipping"); return }
+    private fun sendRumble(session: GipSession, strongPercent: Int, weakPercent: Int, durationMs: Int, motors: Int = GipMotor.ALL) {
+        val conn = session.connection ?: run { log("sendRumble: no connection for player ${session.playerIndex + 1}, skipping"); return }
+        val epOut = session.epOut ?: run { log("sendRumble: no epOut for player ${session.playerIndex + 1}, skipping"); return }
         if (durationMs > 0 && !DeviceConfig.rumbleEnabled(this)) { log("sendRumble: rumble disabled in settings, skipping"); return }
 
         val userStrength = DeviceConfig.rumbleStrength(this)
@@ -722,15 +784,15 @@ class GipBridgeService : Service() {
         // Log only on real state change, not every packet — a sustained rumble effect (e.g.
         // GT's continuous throttle buzz) resends the same magnitude ~15x/sec, and logging
         // every single one buries real signal in noise for no benefit once the state is known.
-        val state = Triple(motors, left, right)
-        if (state != lastLoggedRumbleState) {
-            log("sendRumble: motors=0x${motors.toString(16)} left=$left right=$right durationTens=$durationTens payload=${payload.toHex()}")
-            lastLoggedRumbleState = state
+        val rState = Triple(motors, left, right)
+        if (rState != session.lastLoggedRumbleState) {
+            log("sendRumble (player ${session.playerIndex + 1}): motors=0x${motors.toString(16)} left=$left right=$right durationTens=$durationTens payload=${payload.toHex()}")
+            session.lastLoggedRumbleState = rState
         }
         val hdr = GipHeader(
             command = GipCommand.RUMBLE,
             options = 0, // per xone's gip_send_rumble: clientId only, no INTERNAL flag
-            sequence = nextSeq(),
+            sequence = session.nextSeq(),
             packetLength = payload.size,
         )
         writePacket(conn, epOut, hdr, payload)
@@ -944,13 +1006,13 @@ class GipBridgeService : Service() {
     }
 
     override fun onDestroy() {
-        stopGipSession()
+        for (i in sessions.indices) stopGipSession(i)
         stopG733Session()
         runCatching { unregisterReceiver(usbPermissionReceiver) }
         runCatching { unregisterReceiver(usbAttachReceiver) }
         runCatching { unregisterReceiver(usbDetachReceiver) }
         if (BuildConfig.DEBUG) unregisterTestReceivers()
-        runCatching { injector?.stopRumble() }
+        runCatching { injector?.destroy() }
         runCatching { Shizuku.unbindUserService(userServiceArgs, userServiceConnection, true) }
         runCatching { Shizuku.removeRequestPermissionResultListener(shizukuPermissionListener) }
         super.onDestroy()

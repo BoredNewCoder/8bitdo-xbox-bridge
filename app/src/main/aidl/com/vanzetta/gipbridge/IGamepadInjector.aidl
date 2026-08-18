@@ -8,10 +8,16 @@ import com.vanzetta.gipbridge.IRumbleCallback;
 // /dev/uinput on this device (confirmed live). Binding to this from the main app process
 // gets us both that injection right and a real uinput-backed virtual gamepad.
 interface IGamepadInjector {
-    void injectKey(int keyCode, boolean down);
-    void injectAxes(float x, float y, float z, float rz, float ltrigger, float rtrigger, float hatX, float hatY);
-    void startRumble(IRumbleCallback callback);
-    void stopRumble();
+    // playerIndex selects which uinput virtual gamepad (0 = player 1, 1 = player 2) a call
+    // targets — added for 2-controller support. Each index gets its own uinput device (own
+    // name, own FF effect table), opened lazily via openDevice() once GipBridgeService knows
+    // a real controller is connected for that slot.
+    boolean openDevice(int playerIndex, String name);
+    void closeDevice(int playerIndex);
+    void injectKey(int playerIndex, int keyCode, boolean down);
+    void injectAxes(int playerIndex, float x, float y, float z, float rz, float ltrigger, float rtrigger, float hatX, float hatY);
+    void startRumble(int playerIndex, IRumbleCallback callback);
+    void stopRumble(int playerIndex);
     void openSettings();
     void destroy();
 }
