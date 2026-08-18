@@ -76,6 +76,22 @@ that same wire protocol as an Android USB Host API client, then uses
   prompts from the same process, not something fixable cleanly from app code. Workaround:
   force-stop the app and reopen it (Android TV Settings → Apps → GIP Bridge → Force stop).
   A first-time attach in a fresh app launch always works.
+- **Controllers can stop responding after the device wakes from sleep** — real cause
+  confirmed live (2026-08-17): sleep/wake fully re-enumerates USB, which both controllers
+  attaching at once can turn into a genuine permission-dialog pile-up (two devices
+  requesting permission within milliseconds of each other). If nobody's around to accept a
+  prompt right after wake, it just sits there indefinitely — confirmed live via
+  `adb shell dumpsys activity activities`, which showed the system's own
+  `UsbConfirmActivity` still sitting on screen, unanswered, minutes later. **Real fix**: make
+  sure every controller was accepted with "Always open GIP Bridge when \<device\> is
+  connected" checked during first-time setup (step 6 above) — that persists a real
+  system-level permission grant (`dumpsys usb`'s `device_preferences`, confirmed to survive
+  both sleep and reboot) that skips the dialog on future re-enumerations entirely, not just
+  a one-time accept. If a controller was accepted WITHOUT that box checked earlier, unplug
+  and replug it once with the device awake and the app in the foreground, and check the box
+  that time. If a dialog is already stuck (screen shows a "GIP Bridge" or "Allow app to
+  access device" popup after waking), just answer it — there's no fix that skips a human
+  needing to be present for the very first grant.
 - The G733's **volume wheel doesn't reach some apps** (confirmed with Plex and Pluto TV) —
   it works fine at the system level and in most apps, but these two specifically don't
   react to it. Likely cause: this app exclusively claims the G733's status/battery HID
@@ -209,11 +225,20 @@ adb install gip-bridge-latest.apk
 
 ### 6. Plug in your controller (and headset dongle, if using that part)
 
-Launch GIP Bridge once. It'll request a USB permission dialog for each connected device —
-accept it. From then on it auto-launches whenever the controller is plugged in or the
-device boots, binds to Shizuku automatically, and needs no further interaction — except
-the G733's permission dialog, which Android requires re-accepting after every reboot (see
-"What doesn't work" above for why).
+Launch GIP Bridge once. It'll show a system dialog for each connected device asking to
+open it with GIP Bridge — **check "Always open GIP Bridge when \<device\> is connected"
+before tapping OK.** This isn't just convenience: checking it is what makes Android persist
+a real, durable permission grant for that specific device (confirmed live via
+`adb shell dumpsys usb`'s `device_preferences` block — it's a system-level association, not
+an app-level one, so it survives both device sleep and a full reboot). Skipping the
+checkbox and just tapping OK can still leave you stuck later — see the sleep/wake bullet in
+"What doesn't work" below for what that looks like and why it happens.
+
+Once every device has been accepted with "Always open" checked, GIP Bridge auto-launches
+whenever a controller is plugged in, the device wakes from sleep, or the device boots —
+binds to Shizuku automatically, no further interaction needed — except the G733's
+permission dialog specifically, which Android refuses to persist across a reboot no matter
+what (see "What doesn't work" for why).
 
 ## Using different hardware
 
