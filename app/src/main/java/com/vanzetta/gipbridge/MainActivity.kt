@@ -5,6 +5,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.hardware.usb.UsbManager
 import android.os.Bundle
 import android.os.IBinder
 import android.widget.Button
@@ -69,6 +70,15 @@ class MainActivity : Activity() {
         val svcIntent = Intent(this, GipBridgeService::class.java)
         ContextCompat.startForegroundService(this, svcIntent)
         bindService(svcIntent, serviceConnection, Context.BIND_AUTO_CREATE)
+
+        // The system launches this activity on every controller attach (that launch is what
+        // grants USB permission). Don't leave the log screen on top of whatever is playing.
+        if (intent?.action == UsbManager.ACTION_USB_DEVICE_ATTACHED) moveTaskToBack(true)
+    }
+
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        if (intent?.action == UsbManager.ACTION_USB_DEVICE_ATTACHED) moveTaskToBack(true)
     }
 
     override fun onDestroy() {

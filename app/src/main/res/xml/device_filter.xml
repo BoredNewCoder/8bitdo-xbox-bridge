@@ -1,9 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Matches ANY attached USB device so the app auto-launches regardless of which
-         controller/headset VID:PID is configured (see DeviceConfig.kt / SettingsActivity) —
-         the app's own runtime logic then checks against the configured pair and does
-         nothing if it's not a match. Standard pattern for USB host apps whose exact
-         target hardware isn't fixed at build time. -->
-    <usb-device />
+    <!-- Exact VID:PID entries, not a wildcard. Android only remembers "Use by default" and
+         grants USB permission silently on attach for a filter that names the device, and a
+         wildcard also made this app the default handler for unrelated devices (e.g. the
+         external drive). Add a line here when a new controller/headset VID:PID is configured
+         in DeviceConfig / SettingsActivity. -->
+    <!-- 8BitDo Pro 2 Wired -->
+    <usb-device vendor-id="11720" product-id="8192" />
+    <!-- 8BitDo Ultimate Wired -->
+    <usb-device vendor-id="11720" product-id="8195" />
+    <usb-device vendor-id="11720" product-id="8213" />
+    <!-- Logitech G733 headset -->
+    <usb-device vendor-id="1133" product-id="2741" />
 </resources>

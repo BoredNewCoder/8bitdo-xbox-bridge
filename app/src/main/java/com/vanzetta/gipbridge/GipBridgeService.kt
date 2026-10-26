@@ -33,6 +33,7 @@ import rikka.shizuku.Shizuku
 
 private const val TAG = "GipBridge"
 private const val ACTION_USB_PERMISSION = "com.vanzetta.gipbridge.USB_PERMISSION"
+private const val PERMISSION_GRACE_MS = 2000L
 private const val ACTION_TEST_RUMBLE = "com.vanzetta.gipbridge.TEST_RUMBLE"
 private const val ACTION_TEST_SELECT_HOLD = "com.vanzetta.gipbridge.TEST_SELECT_HOLD"
 private const val ACTION_TEST_NAV = "com.vanzetta.gipbridge.TEST_NAV"
@@ -440,6 +441,18 @@ class GipBridgeService : Service() {
     }
 
     private fun requestPermissionAndConnect(device: UsbDevice) {
+        if (usbManager.hasPermission(device)) {
+            val playerIndex = controllerPlayerIndex(device)
+            if (isHeadset(device)) startG733Session(device) else if (playerIndex >= 0) startGipSession(device, playerIndex)
+            return
+        }
+        // On a real attach the system grants permission when it launches MainActivity for the
+        // saved default, but this receiver can run first. Give that grant a moment to land
+        // before showing the dialog, otherwise the prompt appears on every attach.
+        mainHandler.postDelayed({ requestPermissionNow(device) }, PERMISSION_GRACE_MS)
+    }
+
+    private fun requestPermissionNow(device: UsbDevice) {
         if (usbManager.hasPermission(device)) {
             val playerIndex = controllerPlayerIndex(device)
             if (isHeadset(device)) startG733Session(device) else if (playerIndex >= 0) startGipSession(device, playerIndex)
