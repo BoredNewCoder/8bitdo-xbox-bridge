@@ -92,6 +92,17 @@ that same wire protocol as an Android USB Host API client, then uses
   that time. If a dialog is already stuck (screen shows a "GIP Bridge" or "Allow app to
   access device" popup after waking), just answer it — there's no fix that skips a human
   needing to be present for the very first grant.
+  **v0.10 hardening (confirmed live on a Shield Pro, 2026-10-24):** the dialog could still
+  come back on every wake even with "Always open" checked, for two reasons that are now
+  fixed. (1) `device_filter.xml` was a wildcard (`<usb-device />`), which made this app the
+  saved default for unrelated devices (an external drive) and never gave Android an exact
+  per-controller association to remember — it now lists exact VID:PID pairs. (2) The
+  service called `requestPermission()` the instant an attach broadcast arrived, often
+  before the system had granted permission by launching the saved default activity — it now
+  waits 2 seconds and only asks if permission is still missing. `MainActivity` also moves
+  itself to the background when the system launches it for an attach, so the log screen
+  doesn't cover whatever you're playing. After accepting each controller once with "Always
+  open" checked, a sleep/wake cycle reconnects both with no dialog.
 - The G733's **volume wheel doesn't reach some apps** (confirmed with Plex and Pluto TV) —
   it works fine at the system level and in most apps, but these two specifically don't
   react to it. Likely cause: this app exclusively claims the G733's status/battery HID
@@ -223,6 +234,14 @@ Download the latest APK from [Releases](../../releases) and sideload it the same
 adb install gip-bridge-latest.apk
 ```
 
+Release APKs are debug-signed by whichever machine built them. Android refuses to update
+an app in place when the signing key differs (`INSTALL_FAILED_UPDATE_INCOMPATIBLE`), so
+moving between builds from different machines means `adb uninstall com.vanzetta.gipbridge`
+first, which clears the app's settings, its Shizuku permission and its saved USB defaults.
+To keep your settings, copy `shared_prefs/gip_bridge_config.xml` out with `adb shell run-as
+com.vanzetta.gipbridge cat …` before uninstalling and put it back afterwards, then re-grant
+Shizuku with `adb shell pm grant com.vanzetta.gipbridge moe.shizuku.manager.permission.API_V23`.
+
 ### 6. Plug in your controller (and headset dongle, if using that part)
 
 Launch GIP Bridge once. It'll show a system dialog for each connected device asking to
@@ -247,6 +266,14 @@ Logitech G733 dongle, but neither is hardcoded — open the app and tap **Config
 Devices** to see every currently-attached USB device (name + vendor/product ID) and assign
 one as "Controller" and/or one as "Headset". No rebuild, no file editing. Takes effect on
 the next reconnect of that device (or after a reboot).
+
+As of v0.10, auto-launch on attach (and the saved "Always open" association that skips the
+permission dialog) only applies to the VID:PID pairs listed in
+`app/src/main/res/xml/device_filter.xml` (8BitDo Pro 2 `11720:8192`, Ultimate `11720:8195`
+and `11720:8213`, Logitech G733 `1133:2741`). A different device assigned through Configure
+Devices still works while the app is running, but add a
+`<usb-device vendor-id="…" product-id="…" />` line for it and rebuild if you want it to
+auto-launch and skip the dialog after sleep/reboot.
 
 Two caveats this can't paper over:
 - The GIP protocol layer (`GipProtocol.kt`) only speaks GIP — it'll work for any other
