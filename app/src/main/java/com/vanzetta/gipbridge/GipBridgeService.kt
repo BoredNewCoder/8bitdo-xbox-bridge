@@ -486,6 +486,7 @@ class GipBridgeService : Service() {
     // distinguishable name instead of one staying silently generic.
     private val KNOWN_MODELS = mapOf(
         (11720 to 8213) to "Ultimate Wired Controller for Xbox",
+        (11720 to 8198) to "Ultimate Wired Controller for Xbox (PID 0x2006)",
         (11720 to 8192) to "Pro 2 Wired Controller for Xbox",
     )
     private fun modelNameFor(vendorId: Int, productId: Int): String {

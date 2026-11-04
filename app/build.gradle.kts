@@ -11,11 +11,11 @@ android {
         applicationId = "com.vanzetta.gipbridge"
         minSdk = 26
         targetSdk = 34
-        versionCode = 10
-        versionName = "0.10"
+        versionCode = 11
+        versionName = "0.11"
         ndk {
-            // Shield TV Pro is arm64 — no need to ship other ABIs.
-            abiFilters += "arm64-v8a"
+            // Cover both 64-bit Android TV devices and 32-bit SaluteTV userlands.
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
         }
         externalNativeBuild {
             cmake {

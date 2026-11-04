@@ -10,6 +10,8 @@
     <!-- 8BitDo Ultimate Wired -->
     <usb-device vendor-id="11720" product-id="8195" />
     <usb-device vendor-id="11720" product-id="8213" />
+    <!-- 8BitDo Ultimate Wired Controller for Xbox (SaluteTV-tested PID) -->
+    <usb-device vendor-id="11720" product-id="8198" />
     <!-- Logitech G733 headset -->
     <usb-device vendor-id="1133" product-id="2741" />
 </resources>
