@@ -11,8 +11,8 @@ android {
         applicationId = "com.vanzetta.gipbridge"
         minSdk = 26
         targetSdk = 34
-        versionCode = 11
-        versionName = "0.11"
+        versionCode = 12
+        versionName = "0.12"
         ndk {
             // Cover both 64-bit Android TV devices and 32-bit SaluteTV userlands.
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")
@@ -55,4 +55,8 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.7.1")
     implementation("dev.rikka.shizuku:api:13.1.5")
     implementation("dev.rikka.shizuku:provider:13.1.5")
+    // Talks to the TV's own adbd on 127.0.0.1 to restart the Shizuku server (see ShizukuStarter).
+    implementation("dev.mobile:dadb:1.2.10")
+
+    testImplementation("junit:junit:4.13.2")
 }

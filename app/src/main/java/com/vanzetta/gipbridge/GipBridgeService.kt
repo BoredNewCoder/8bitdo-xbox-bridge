@@ -38,6 +38,7 @@ private const val ACTION_TEST_RUMBLE = "com.vanzetta.gipbridge.TEST_RUMBLE"
 private const val ACTION_TEST_SELECT_HOLD = "com.vanzetta.gipbridge.TEST_SELECT_HOLD"
 private const val ACTION_TEST_NAV = "com.vanzetta.gipbridge.TEST_NAV"
 private const val SHIZUKU_PERMISSION_REQUEST_CODE = 4242
+private const val HEALTH_TICK_MS = 5_000L
 private const val XBOX_LONG_PRESS_MS = 500L
 private const val INPUT_LOG_THROTTLE_MS = 200L
 private const val NOTIF_CHANNEL_ID = "gip_bridge_service"
@@ -184,6 +185,47 @@ class GipBridgeService : Service() {
         override fun onServiceDisconnected(name: ComponentName) {
             injector = null
             log("Shizuku injector service disconnected.")
+        }
+    }
+
+    // Self-heal: a Shizuku server that stops handing out its binder (seen after ~1.5 days
+    // uptime) leaves the bridge reading the pad with nowhere to send it. See InjectorHealth.
+    private var unhealthySince: Long? = null
+    private var lastRestartAt = Long.MIN_VALUE / 2
+    @Volatile private var shizukuRestarting = false
+
+    private val healthTick = object : Runnable {
+        override fun run() {
+            checkInjectorHealth()
+            mainHandler.postDelayed(this, HEALTH_TICK_MS)
+        }
+    }
+
+    private fun checkInjectorHealth() {
+        val now = SystemClock.elapsedRealtime()
+        if (injector != null) { unhealthySince = null; return }
+        val since = unhealthySince ?: now.also { unhealthySince = it }
+        val binderAlive = Shizuku.pingBinder()
+        val granted = binderAlive && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+        when (InjectorHealth.decide(binderAlive, granted, false, now - since, now - lastRestartAt)) {
+            Heal.NONE -> Unit
+            Heal.REBIND -> { log("Injector not connected, rebinding."); bindInjector() }
+            Heal.RESTART_SHIZUKU -> { lastRestartAt = now; restartShizuku(binderAlive) }
+        }
+    }
+
+    private fun restartShizuku(binderAlive: Boolean) {
+        if (shizukuRestarting) return
+        shizukuRestarting = true
+        log("Shizuku ${if (binderAlive) "not serving the injector" else "not running"}, restarting it through local adb...")
+        thread(name = "shizuku-restart") {
+            try {
+                log("Shizuku restart done: ${ShizukuStarter.start(this)}")
+            } catch (e: Exception) {
+                log("Shizuku restart failed: ${e.message}. Allow USB debugging on the TV if it asks.")
+            } finally {
+                shizukuRestarting = false
+            }
         }
     }
 
@@ -394,6 +436,7 @@ class GipBridgeService : Service() {
 
         Shizuku.addRequestPermissionResultListener(shizukuPermissionListener)
         Shizuku.addBinderReceivedListenerSticky { setupShizuku() }
+        mainHandler.postDelayed(healthTick, HEALTH_TICK_MS)
 
         val c2 = if (DeviceConfig.controller2Configured(this))
             "controller 2 (vid=${DeviceConfig.controller2Vid(this)} pid=${DeviceConfig.controller2Pid(this)})"
@@ -1020,6 +1063,7 @@ class GipBridgeService : Service() {
     }
 
     override fun onDestroy() {
+        mainHandler.removeCallbacks(healthTick)
         for (i in sessions.indices) stopGipSession(i)
         stopG733Session()
         runCatching { unregisterReceiver(usbPermissionReceiver) }

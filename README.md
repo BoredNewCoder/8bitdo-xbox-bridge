@@ -215,7 +215,15 @@ Open it once on the TV so it can initialize.
 
 ### 4. Start Shizuku
 
-Non-rooted Shizuku doesn't survive a reboot and has to be started this way every time:
+As of v0.12 the bridge starts Shizuku itself: it runs at boot, and when the injector is not
+connected for 15 s (Shizuku stopped after a reboot, or running but no longer serving the
+bridge) it restarts Shizuku through the TV's own adb on `127.0.0.1:5555`, at most once every
+2 minutes. The first time, the TV asks "Allow USB debugging?" for the bridge's key: tick
+"Always allow". This needs USB debugging on and adb listening on TCP port 5555, which a
+TV that you already adb-connect to has. Shizuku itself still has to be installed and
+authorized once (`pm grant … API_V23`, or the dialog the app shows).
+
+Without that, non-rooted Shizuku doesn't survive a reboot and has to be started by hand:
 
 **From a PC:** open the Shizuku app on the TV, go to "Start by connecting to a computer" →
 "View command" — it shows the exact `adb shell <path>/libshizuku.so` command for your
@@ -272,8 +280,9 @@ the next reconnect of that device (or after a reboot).
 As of v0.11, auto-launch on attach (and the saved "Always open" association that skips the
 permission dialog) only applies to the VID:PID pairs listed in
 `app/src/main/res/xml/device_filter.xml` (8BitDo Pro 2 `11720:8192`, Ultimate `11720:8195`
-and `11720:8213`/`11720:8198`, Logitech G733 `1133:2741`). The default controller remains
-the upstream PID `8213`; select another supported controller once in **Configure Devices**.
+and `11720:8213`/`11720:8198`, Logitech G733 `1133:2741`). As of v0.12 the default controller
+is the SaluteTV one, PID `8198`; for the upstream PID `8213` select it once in
+**Configure Devices**.
 A different device assigned there still works while the app is running, but add a
 `<usb-device vendor-id="…" product-id="…" />` line for it and rebuild if you want it to
 auto-launch and skip the dialog after sleep/reboot.
