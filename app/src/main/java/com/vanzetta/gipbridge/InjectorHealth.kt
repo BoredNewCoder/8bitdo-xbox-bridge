@@ -21,4 +21,9 @@ object InjectorHealth {
             if (sinceRestartMs >= RESTART_COOLDOWN_MS) Heal.RESTART_SHIZUKU else Heal.NONE
         else -> Heal.REBIND
     }
+
+    // Right after a wake-up the injector is often gone for a known reason, so rebind at once
+    // instead of waiting out GRACE_MS; anything harder stays with the normal escalation.
+    fun decideAfterWake(binderAlive: Boolean, permissionGranted: Boolean, injectorConnected: Boolean): Heal =
+        if (!injectorConnected && binderAlive && permissionGranted) Heal.REBIND else Heal.NONE
 }

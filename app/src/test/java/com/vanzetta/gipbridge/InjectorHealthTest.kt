@@ -35,4 +35,16 @@ class InjectorHealthTest {
 
     @Test fun ungrantedPermissionIsLeftToTheUser() =
         assertEquals(Heal.NONE, decide(permission = false, unhealthyMs = 999_999))
+
+    @Test fun afterWakeADroppedInjectorIsReboundWithoutWaitingForTheGracePeriod() =
+        assertEquals(Heal.REBIND, InjectorHealth.decideAfterWake(binderAlive = true, permissionGranted = true, injectorConnected = false))
+
+    @Test fun afterWakeAConnectedInjectorIsLeftAlone() =
+        assertEquals(Heal.NONE, InjectorHealth.decideAfterWake(binderAlive = true, permissionGranted = true, injectorConnected = true))
+
+    @Test fun afterWakeMissingBinderIsLeftToTheNormalEscalation() =
+        assertEquals(Heal.NONE, InjectorHealth.decideAfterWake(binderAlive = false, permissionGranted = false, injectorConnected = false))
+
+    @Test fun afterWakeUngrantedPermissionIsLeftToTheUser() =
+        assertEquals(Heal.NONE, InjectorHealth.decideAfterWake(binderAlive = true, permissionGranted = false, injectorConnected = false))
 }
