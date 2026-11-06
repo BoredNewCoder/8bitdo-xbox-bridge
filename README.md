@@ -103,6 +103,13 @@ that same wire protocol as an Android USB Host API client, then uses
   itself to the background when the system launches it for an attach, so the log screen
   doesn't cover whatever you're playing. After accepting each controller once with "Always
   open" checked, a sleep/wake cycle reconnects both with no dialog.
+  **v0.13, deep sleep without USB re-enumeration (confirmed live on a Salute TV, 2026-11-06):**
+  on some TVs the USB link survives deep sleep with no detach event, but the controller
+  stays silent until it gets a new handshake, and pressing its Xbox button does nothing
+  because nothing reaches the bridge. The bridge now watches each controller session: if
+  no packet arrives for 60 s (a healthy pad sends a STATUS packet about every 20 s), it
+  closes the session and opens it again, which repeats the handshake. The check runs
+  every 5 s, so after the TV wakes the controller comes back within seconds, with no tap.
 - The G733's **volume wheel doesn't reach some apps** (confirmed with Plex and Pluto TV) —
   it works fine at the system level and in most apps, but these two specifically don't
   react to it. Likely cause: this app exclusively claims the G733's status/battery HID

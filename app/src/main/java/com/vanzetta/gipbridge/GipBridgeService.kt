@@ -76,6 +76,7 @@ class GipBridgeService : Service() {
         var readerThread: Thread? = null
         var injectorThread: Thread? = null
         @Volatile var running = false
+        @Volatile var lastPacketAt = SystemClock.elapsedRealtime()
         val gamepadQueue = java.util.concurrent.ArrayBlockingQueue<GamepadState>(1)
         var lastButtons = 0
         var lastInputLogAtMs = 0L
@@ -196,8 +197,25 @@ class GipBridgeService : Service() {
 
     private val healthTick = object : Runnable {
         override fun run() {
+            checkSessionHealth()
             checkInjectorHealth()
             mainHandler.postDelayed(this, HEALTH_TICK_MS)
+        }
+    }
+
+    // After deep sleep the USB link survives without a detach event, but the pad stays silent
+    // until a new handshake. elapsedRealtime counts sleep, so the first tick after wake sees it.
+    private fun checkSessionHealth() {
+        val now = SystemClock.elapsedRealtime()
+        for (pi in sessions.indices) {
+            val session = sessions[pi] ?: continue
+            val silentMs = now - session.lastPacketAt
+            if (!SessionHealth.isDead(silentMs)) continue
+            log("Controller (player ${pi + 1}) silent for ${silentMs / 1000} s, restarting its session.")
+            stopGipSession(pi)
+            usbManager.deviceList.values
+                .filter { controllerPlayerIndex(it) == pi }
+                .forEach { requestPermissionAndConnect(it) }
         }
     }
 
@@ -642,6 +660,7 @@ class GipBridgeService : Service() {
             // a short sleep here guarantees this never busy-spins regardless of which.
             if (n <= 0) { Thread.sleep(50); continue }
 
+            session.lastPacketAt = SystemClock.elapsedRealtime()
             packetsSeen++
 
             val data = buf.copyOf(n)

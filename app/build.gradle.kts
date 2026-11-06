@@ -11,8 +11,8 @@ android {
         applicationId = "com.vanzetta.gipbridge"
         minSdk = 26
         targetSdk = 34
-        versionCode = 12
-        versionName = "0.12"
+        versionCode = 13
+        versionName = "0.13"
         ndk {
             // Cover both 64-bit Android TV devices and 32-bit SaluteTV userlands.
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")
