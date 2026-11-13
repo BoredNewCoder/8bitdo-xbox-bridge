@@ -20,7 +20,7 @@ private const val KEY_RUMBLE_STRENGTH = "rumble_strength"
 // Ultimate Wired Controller for Xbox and a Logitech G733 Lightspeed dongle. Override via
 // SettingsActivity for different hardware, no rebuild needed.
 private const val DEFAULT_CONTROLLER_VID = 11720
-private const val DEFAULT_CONTROLLER_PID = 8213
+private const val DEFAULT_CONTROLLER_PID = 8198
 private const val DEFAULT_HEADSET_VID = 1133
 private const val DEFAULT_HEADSET_PID = 2741
 // No real default for the second controller slot — unset (0/0) until the user assigns one

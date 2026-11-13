@@ -103,6 +103,16 @@ that same wire protocol as an Android USB Host API client, then uses
   itself to the background when the system launches it for an attach, so the log screen
   doesn't cover whatever you're playing. After accepting each controller once with "Always
   open" checked, a sleep/wake cycle reconnects both with no dialog.
+  **v0.13, deep sleep without USB re-enumeration (confirmed live on a Salute TV, 2026-11-06):**
+  on some TVs the USB link survives deep sleep with no detach event, but the controller
+  stays silent until it gets a new handshake, and pressing its Xbox button does nothing
+  because nothing reaches the bridge. The bridge listens for the screen turning on and, if
+  a controller sent nothing in the 2 s after the wake-up, closes its session and opens it
+  again, which repeats the handshake; the controller is back about 3 s after the TV wakes.
+  Repeated wake signals count as one, and the Shizuku injector is rebound at the same time.
+  As a fallback, a session that stays silent for 60 s (a healthy pad sends a STATUS packet
+  about every 20 s) is reopened the same way. If opening the USB device fails, it is retried
+  up to 5 times with growing pauses (0.5 s to 8 s); detaching the pad cancels the retries.
 - The G733's **volume wheel doesn't reach some apps** (confirmed with Plex and Pluto TV) —
   it works fine at the system level and in most apps, but these two specifically don't
   react to it. Likely cause: this app exclusively claims the G733's status/battery HID
@@ -174,6 +184,8 @@ its data wiped, or a config gets reset, check these next:
 
 - An Android TV device with a USB-A port (built and tested on an NVIDIA Shield TV Pro,
   Android 11)
+- 8BitDo Ultimate Wired Controller for Xbox (VID `11720`/`0x2DC8`, PID `8213`/`0x2015`
+  or PID `8198`/`0x2006`; the latter was tested on a SaluteTV running Android 13)
 - A PC with [`adb`](https://developer.android.com/tools/releases/platform-tools)
   (Android SDK Platform Tools), on the same network as the device, or a USB-C/micro-USB
   cable to it
@@ -213,7 +225,15 @@ Open it once on the TV so it can initialize.
 
 ### 4. Start Shizuku
 
-Non-rooted Shizuku doesn't survive a reboot and has to be started this way every time:
+As of v0.12 the bridge starts Shizuku itself: it runs at boot, and when the injector is not
+connected for 15 s (Shizuku stopped after a reboot, or running but no longer serving the
+bridge) it restarts Shizuku through the TV's own adb on `127.0.0.1:5555`, at most once every
+2 minutes. The first time, the TV asks "Allow USB debugging?" for the bridge's key: tick
+"Always allow". This needs USB debugging on and adb listening on TCP port 5555, which a
+TV that you already adb-connect to has. Shizuku itself still has to be installed and
+authorized once (`pm grant … API_V23`, or the dialog the app shows).
+
+Without that, non-rooted Shizuku doesn't survive a reboot and has to be started by hand:
 
 **From a PC:** open the Shizuku app on the TV, go to "Start by connecting to a computer" →
 "View command" — it shows the exact `adb shell <path>/libshizuku.so` command for your
@@ -267,11 +287,13 @@ Devices** to see every currently-attached USB device (name + vendor/product ID) 
 one as "Controller" and/or one as "Headset". No rebuild, no file editing. Takes effect on
 the next reconnect of that device (or after a reboot).
 
-As of v0.10, auto-launch on attach (and the saved "Always open" association that skips the
+As of v0.11, auto-launch on attach (and the saved "Always open" association that skips the
 permission dialog) only applies to the VID:PID pairs listed in
 `app/src/main/res/xml/device_filter.xml` (8BitDo Pro 2 `11720:8192`, Ultimate `11720:8195`
-and `11720:8213`, Logitech G733 `1133:2741`). A different device assigned through Configure
-Devices still works while the app is running, but add a
+and `11720:8213`/`11720:8198`, Logitech G733 `1133:2741`). As of v0.12 the default controller
+is the SaluteTV one, PID `8198`; for the upstream PID `8213` select it once in
+**Configure Devices**.
+A different device assigned there still works while the app is running, but add a
 `<usb-device vendor-id="…" product-id="…" />` line for it and rebuild if you want it to
 auto-launch and skip the dialog after sleep/reboot.
 

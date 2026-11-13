@@ -38,6 +38,9 @@ private const val ACTION_TEST_RUMBLE = "com.vanzetta.gipbridge.TEST_RUMBLE"
 private const val ACTION_TEST_SELECT_HOLD = "com.vanzetta.gipbridge.TEST_SELECT_HOLD"
 private const val ACTION_TEST_NAV = "com.vanzetta.gipbridge.TEST_NAV"
 private const val SHIZUKU_PERMISSION_REQUEST_CODE = 4242
+private const val HEALTH_TICK_MS = 5_000L
+
+private enum class OpenResult { STARTED, ALREADY_RUNNING, FAILED }
 private const val XBOX_LONG_PRESS_MS = 500L
 private const val INPUT_LOG_THROTTLE_MS = 200L
 private const val NOTIF_CHANNEL_ID = "gip_bridge_service"
@@ -75,6 +78,7 @@ class GipBridgeService : Service() {
         var readerThread: Thread? = null
         var injectorThread: Thread? = null
         @Volatile var running = false
+        @Volatile var lastPacketAt = SystemClock.elapsedRealtime()
         val gamepadQueue = java.util.concurrent.ArrayBlockingQueue<GamepadState>(1)
         var lastButtons = 0
         var lastInputLogAtMs = 0L
@@ -132,6 +136,7 @@ class GipBridgeService : Service() {
     // binding keeps working with zero changes needed on their end). Index 1 = player 2, only
     // used once DeviceConfig.controller2Configured() is true.
     private val sessions = arrayOfNulls<GipSession>(2)
+    private val openRetries = arrayOfNulls<Runnable>(2)
 
     // Read fresh each call (not cached) so a config change via SettingsActivity takes
     // effect on the next USB attach event without needing a service restart. Returns the
@@ -187,6 +192,111 @@ class GipBridgeService : Service() {
         }
     }
 
+    // Self-heal: a Shizuku server that stops handing out its binder (seen after ~1.5 days
+    // uptime) leaves the bridge reading the pad with nowhere to send it. See InjectorHealth.
+    private var unhealthySince: Long? = null
+    private var lastRestartAt = Long.MIN_VALUE / 2
+    @Volatile private var shizukuRestarting = false
+
+    private val healthTick = object : Runnable {
+        override fun run() {
+            checkSessionHealth()
+            checkInjectorHealth()
+            mainHandler.postDelayed(this, HEALTH_TICK_MS)
+        }
+    }
+
+    // Deep sleep leaves the USB link up without a detach, but the pad stays silent until a new
+    // handshake. The 60 s silence watchdog below is only the fallback; screen-on and user-present
+    // are merged into one wake-up and give each session a short window to prove it is alive.
+    private val wakeRecovery = WakeRecovery()
+    private var pendingWakeAt = 0L
+
+    private val wakeReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val action = intent.action ?: return
+            log("Power event: $action")
+            if (action == Intent.ACTION_SCREEN_OFF) return
+            val wakeAt = wakeRecovery.onWakeSignal(SystemClock.elapsedRealtime()) ?: return
+            pendingWakeAt = wakeAt
+            mainHandler.removeCallbacks(wakeCheck)
+            mainHandler.postDelayed(wakeCheck, WakeRecovery.PACKET_WINDOW_MS)
+        }
+    }
+
+    private val wakeCheck = Runnable {
+        rebindInjectorAfterWake()
+        for (pi in sessions.indices) {
+            val session = sessions[pi]
+            if (session != null && !WakeRecovery.needsRestart(session.lastPacketAt, pendingWakeAt)) continue
+            if (session == null && !deviceAttached(pi)) continue
+            log(
+                if (session == null) "Wake-up: controller (player ${pi + 1}) has no session, opening it."
+                else "Wake-up: controller (player ${pi + 1}) sent nothing for ${WakeRecovery.PACKET_WINDOW_MS} ms, restarting its session."
+            )
+            restartSession(pi)
+        }
+    }
+
+    private fun rebindInjectorAfterWake() {
+        val binderAlive = Shizuku.pingBinder()
+        val granted = binderAlive && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+        if (InjectorHealth.decideAfterWake(binderAlive, granted, injector != null) == Heal.REBIND) {
+            log("Wake-up: injector not connected, rebinding now.")
+            bindInjector()
+        }
+    }
+
+    private fun deviceAttached(playerIndex: Int) =
+        usbManager.deviceList.values.any { controllerPlayerIndex(it) == playerIndex }
+
+    private fun restartSession(playerIndex: Int) {
+        stopGipSession(playerIndex)
+        usbManager.deviceList.values
+            .filter { controllerPlayerIndex(it) == playerIndex }
+            .forEach { requestPermissionAndConnect(it) }
+    }
+
+    // elapsedRealtime counts sleep, so the first tick after wake sees the whole silence.
+    private fun checkSessionHealth() {
+        val now = SystemClock.elapsedRealtime()
+        for (pi in sessions.indices) {
+            val session = sessions[pi] ?: continue
+            val silentMs = now - session.lastPacketAt
+            if (!SessionHealth.isDead(silentMs)) continue
+            log("Controller (player ${pi + 1}) silent for ${silentMs / 1000} s, restarting its session.")
+            restartSession(pi)
+        }
+    }
+
+    private fun checkInjectorHealth() {
+        val now = SystemClock.elapsedRealtime()
+        if (injector != null) { unhealthySince = null; return }
+        val since = unhealthySince ?: now.also { unhealthySince = it }
+        val binderAlive = Shizuku.pingBinder()
+        val granted = binderAlive && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+        when (InjectorHealth.decide(binderAlive, granted, false, now - since, now - lastRestartAt)) {
+            Heal.NONE -> Unit
+            Heal.REBIND -> { log("Injector not connected, rebinding."); bindInjector() }
+            Heal.RESTART_SHIZUKU -> { lastRestartAt = now; restartShizuku(binderAlive) }
+        }
+    }
+
+    private fun restartShizuku(binderAlive: Boolean) {
+        if (shizukuRestarting) return
+        shizukuRestarting = true
+        log("Shizuku ${if (binderAlive) "not serving the injector" else "not running"}, restarting it through local adb...")
+        thread(name = "shizuku-restart") {
+            try {
+                log("Shizuku restart done: ${ShizukuStarter.start(this)}")
+            } catch (e: Exception) {
+                log("Shizuku restart failed: ${e.message}. Allow USB debugging on the TV if it asks.")
+            } finally {
+                shizukuRestarting = false
+            }
+        }
+    }
+
     private val shizukuPermissionListener = Shizuku.OnRequestPermissionResultListener { _, grantResult ->
         if (grantResult == PackageManager.PERMISSION_GRANTED) {
             log("Shizuku permission granted, binding injector service...")
@@ -226,7 +336,7 @@ class GipBridgeService : Service() {
                     log("USB permission granted for ${device.deviceName}")
                     val playerIndex = controllerPlayerIndex(device)
                     if (isHeadset(device)) startG733Session(device)
-                    else if (playerIndex >= 0) startGipSession(device, playerIndex)
+                    else if (playerIndex >= 0) connectGip(device, playerIndex)
                 } else {
                     log("USB permission DENIED")
                 }
@@ -358,6 +468,7 @@ class GipBridgeService : Service() {
             val playerIndex = controllerPlayerIndex(device)
             if (playerIndex >= 0) {
                 log("Controller (player ${playerIndex + 1}) detached.")
+                cancelOpenRetry(playerIndex)
                 stopGipSession(playerIndex)
             } else if (isHeadset(device)) {
                 log("Headset detached.")
@@ -387,6 +498,18 @@ class GipBridgeService : Service() {
             @Suppress("UnspecifiedRegisterReceiverFlag")
             registerReceiver(usbDetachReceiver, detachFilter)
         }
+        // Screen power broadcasts can't be declared in the manifest, so they are registered here.
+        val wakeFilter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_USER_PRESENT)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(wakeReceiver, wakeFilter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(wakeReceiver, wakeFilter)
+        }
         // Debug-only remote test/diagnostic hooks (Test Rumble, SELECT-hold, nav, force-enable
         // rumble) — real dev tooling built during bring-up, not part of the shipped feature
         // set. Gated out of release builds entirely rather than just left in unused.
@@ -394,6 +517,7 @@ class GipBridgeService : Service() {
 
         Shizuku.addRequestPermissionResultListener(shizukuPermissionListener)
         Shizuku.addBinderReceivedListenerSticky { setupShizuku() }
+        mainHandler.postDelayed(healthTick, HEALTH_TICK_MS)
 
         val c2 = if (DeviceConfig.controller2Configured(this))
             "controller 2 (vid=${DeviceConfig.controller2Vid(this)} pid=${DeviceConfig.controller2Pid(this)})"
@@ -443,7 +567,7 @@ class GipBridgeService : Service() {
     private fun requestPermissionAndConnect(device: UsbDevice) {
         if (usbManager.hasPermission(device)) {
             val playerIndex = controllerPlayerIndex(device)
-            if (isHeadset(device)) startG733Session(device) else if (playerIndex >= 0) startGipSession(device, playerIndex)
+            if (isHeadset(device)) startG733Session(device) else if (playerIndex >= 0) connectGip(device, playerIndex)
             return
         }
         // On a real attach the system grants permission when it launches MainActivity for the
@@ -455,7 +579,7 @@ class GipBridgeService : Service() {
     private fun requestPermissionNow(device: UsbDevice) {
         if (usbManager.hasPermission(device)) {
             val playerIndex = controllerPlayerIndex(device)
-            if (isHeadset(device)) startG733Session(device) else if (playerIndex >= 0) startGipSession(device, playerIndex)
+            if (isHeadset(device)) startG733Session(device) else if (playerIndex >= 0) connectGip(device, playerIndex)
             return
         }
         // Confirmed live: requesting permission while nothing is in the foreground (TV
@@ -486,6 +610,7 @@ class GipBridgeService : Service() {
     // distinguishable name instead of one staying silently generic.
     private val KNOWN_MODELS = mapOf(
         (11720 to 8213) to "Ultimate Wired Controller for Xbox",
+        (11720 to 8198) to "Ultimate Wired Controller for Xbox (PID 0x2006)",
         (11720 to 8192) to "Pro 2 Wired Controller for Xbox",
     )
     private fun modelNameFor(vendorId: Int, productId: Int): String {
@@ -493,8 +618,8 @@ class GipBridgeService : Service() {
         return "8BitDo GIP Bridge Gamepad ($model)"
     }
 
-    private fun startGipSession(device: UsbDevice, playerIndex: Int) {
-        if (sessions[playerIndex] != null) { log("Player ${playerIndex + 1} session already running, ignoring duplicate start."); return }
+    private fun startGipSession(device: UsbDevice, playerIndex: Int): OpenResult {
+        if (sessions[playerIndex] != null) { log("Player ${playerIndex + 1} session already running, ignoring duplicate start."); return OpenResult.ALREADY_RUNNING }
         // Real model name resolved immediately from the standard Android USB device
         // descriptor (device.vendorId/productId) — no need to wait for the GIP-level
         // ANNOUNCE packet, which turned out unreliable to depend on: a controller that had
@@ -513,7 +638,7 @@ class GipBridgeService : Service() {
         val iface: UsbInterface? = (0 until device.interfaceCount)
             .map { device.getInterface(it) }
             .firstOrNull { it.id == 0 }
-        if (iface == null) { log("ERROR: interface 0 not found"); return }
+        if (iface == null) { log("ERROR: interface 0 not found"); return OpenResult.FAILED }
 
         var epIn: UsbEndpoint? = null
         var epOut: UsbEndpoint? = null
@@ -522,11 +647,15 @@ class GipBridgeService : Service() {
             if (ep.direction == UsbConstants.USB_DIR_IN) epIn = ep
             if (ep.direction == UsbConstants.USB_DIR_OUT) epOut = ep
         }
-        if (epIn == null || epOut == null) { log("ERROR: expected IN+OUT endpoints not found on interface 0"); return }
+        if (epIn == null || epOut == null) { log("ERROR: expected IN+OUT endpoints not found on interface 0"); return OpenResult.FAILED }
 
         val connection: UsbDeviceConnection? = usbManager.openDevice(device)
-        if (connection == null) { log("ERROR: openDevice failed"); return }
-        if (!connection.claimInterface(iface, true)) { log("ERROR: claimInterface failed"); return }
+        if (connection == null) { log("ERROR: openDevice failed"); return OpenResult.FAILED }
+        if (!connection.claimInterface(iface, true)) {
+            log("ERROR: claimInterface failed")
+            connection.close()
+            return OpenResult.FAILED
+        }
 
         // xone's wired driver explicitly re-asserts interface 1 (audio) alt-setting 0 —
         // "mandatory for certain third party devices" per their own comment — even though
@@ -558,6 +687,39 @@ class GipBridgeService : Service() {
 
         session.readerThread = thread(name = "gip-reader-p$playerIndex") { readLoop(session, connection, epIn, epOut) }
         session.injectorThread = thread(name = "gip-injector-p$playerIndex") { gipInjectLoop(session) }
+        return OpenResult.STARTED
+    }
+
+    // Opening can fail right after wake-up while the USB host is still coming back, so a failed
+    // open is retried a few times with growing pauses. Detach and service stop cancel the retries.
+    private fun connectGip(device: UsbDevice, playerIndex: Int) {
+        cancelOpenRetry(playerIndex)
+        if (startGipSession(device, playerIndex) == OpenResult.FAILED) scheduleOpenRetry(device.deviceName, playerIndex, attempt = 0)
+    }
+
+    private fun scheduleOpenRetry(deviceName: String, playerIndex: Int, attempt: Int) {
+        val delay = OpenRetry.delayMs(attempt)
+        if (delay == null) {
+            log("Giving up opening player ${playerIndex + 1} after ${OpenRetry.MAX_RETRIES} retries; it reconnects on the next attach or wake-up.")
+            return
+        }
+        log("Retrying to open player ${playerIndex + 1} in $delay ms (retry ${attempt + 1}/${OpenRetry.MAX_RETRIES}).")
+        val retry = Runnable {
+            openRetries[playerIndex] = null
+            val device = usbManager.deviceList[deviceName]
+            when {
+                device == null -> log("Player ${playerIndex + 1} device is gone, not retrying.")
+                !usbManager.hasPermission(device) -> log("Player ${playerIndex + 1} has no USB permission, not retrying.")
+                startGipSession(device, playerIndex) == OpenResult.FAILED -> scheduleOpenRetry(deviceName, playerIndex, attempt + 1)
+            }
+        }
+        openRetries[playerIndex] = retry
+        mainHandler.postDelayed(retry, delay)
+    }
+
+    private fun cancelOpenRetry(playerIndex: Int) {
+        openRetries[playerIndex]?.let { mainHandler.removeCallbacks(it) }
+        openRetries[playerIndex] = null
     }
 
     private fun stopGipSession(playerIndex: Int) {
@@ -598,6 +760,7 @@ class GipBridgeService : Service() {
             // a short sleep here guarantees this never busy-spins regardless of which.
             if (n <= 0) { Thread.sleep(50); continue }
 
+            session.lastPacketAt = SystemClock.elapsedRealtime()
             packetsSeen++
 
             val data = buf.copyOf(n)
@@ -1019,8 +1182,11 @@ class GipBridgeService : Service() {
     }
 
     override fun onDestroy() {
-        for (i in sessions.indices) stopGipSession(i)
+        mainHandler.removeCallbacks(healthTick)
+        mainHandler.removeCallbacks(wakeCheck)
+        for (i in sessions.indices) { cancelOpenRetry(i); stopGipSession(i) }
         stopG733Session()
+        runCatching { unregisterReceiver(wakeReceiver) }
         runCatching { unregisterReceiver(usbPermissionReceiver) }
         runCatching { unregisterReceiver(usbAttachReceiver) }
         runCatching { unregisterReceiver(usbDetachReceiver) }
